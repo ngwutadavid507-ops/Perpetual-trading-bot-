@@ -1,0 +1,26 @@
+services:
+  - type: worker
+    name: perp-signal-bot
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: EXCHANGES
+        value: bybit,okx,bingx
+      - key: TIMEFRAME
+        value: 15m
+      - key: MIN_24H_VOLUME_USDT
+        value: "5000000"
+      - key: MIN_CONFIDENCE_DEFAULT
+        value: "65"
+      - key: MIN_CONFIDENCE_BTC
+        value: "85"
+      - key: SCAN_INTERVAL_SECONDS
+        value: "300"
+      - key: MIN_RISK_REWARD
+        value: "1.5"
