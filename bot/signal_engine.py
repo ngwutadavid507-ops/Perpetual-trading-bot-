@@ -1,12 +1,18 @@
 """
 Combines pattern detection + indicators into a scored signal with
-entry zone, stop loss, and take profit — the framework from the lesson:
-confluence of S/R level + candle confirmation + indicator agreement,
-with SL beyond the invalidation point and TP at the next opposing level,
-filtered by minimum risk:reward.
+entry zone, stop loss, take profit, and dynamic leverage based on
+confidence score and token volatility (ATR-based).
+
+Leverage table:
+Confidence   Low Volatility   High Volatility
+70-74%       5x               3x
+75-79%       7x               5x
+80-84%       10x              7x
+85%+         15x              10x
 """
 
 from dataclasses import dataclass
+import pandas as pd
 
 from bot.patterns import detect_engulfing, detect_pin_bar
 from bot.indicators import add_indicators, find_support_resistance, nearest_level
@@ -16,13 +22,55 @@ from bot.indicators import add_indicators, find_support_resistance, nearest_leve
 class Signal:
     symbol: str
     exchange: str
-    direction: str          # "long" or "short"
-    confidence: float       # 0-100
+    direction: str
+    confidence: float
     entry: float
     stop_loss: float
     take_profit: float
     risk_reward: float
+    leverage: int
     reasons: list[str]
+
+
+def _calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
+    """Average True Range — measures recent volatility."""
+    high = df["high"]
+    low = df["low"]
+    close = df["close"].shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - close).abs(),
+        (low - close).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(period).mean().iloc[-1]
+
+
+def _calculate_volatility(df: pd.DataFrame) -> str:
+    """
+    Returns 'high' or 'low' volatility based on ATR as a
+    percentage of current price. Above 2% = high volatility.
+    """
+    atr = _calculate_atr(df)
+    price = df["close"].iloc[-1]
+    if price == 0:
+        return "high"
+    atr_pct = (atr / price) * 100
+    return "high" if atr_pct >= 2.0 else "low"
+
+
+def _calculate_leverage(confidence: float, volatility: str) -> int:
+    """
+    Dynamic leverage capped at 15x based on confidence and volatility.
+    Lower confidence or higher volatility = lower leverage.
+    """
+    if confidence >= 85:
+        return 15 if volatility == "low" else 10
+    elif confidence >= 80:
+        return 10 if volatility == "low" else 7
+    elif confidence >= 75:
+        return 7 if volatility == "low" else 5
+    else:
+        return 5 if volatility == "low" else 3
 
 
 def _score_and_direction(df, support_levels, resistance_levels) -> tuple[str | None, float, list[str]]:
@@ -106,7 +154,7 @@ def build_signal(symbol: str, exchange_id: str, raw_df, min_risk_reward: float) 
     if direction is None:
         return None
 
-    price = df.iloc[-1]["close"]
+    price = df["close"].iloc[-1]
     recent_swing_low = df["low"].tail(10).min()
     recent_swing_high = df["high"].tail(10).max()
 
@@ -130,6 +178,9 @@ def build_signal(symbol: str, exchange_id: str, raw_df, min_risk_reward: float) 
     if rr < min_risk_reward:
         return None
 
+    volatility = _calculate_volatility(df)
+    leverage = _calculate_leverage(confidence, volatility)
+
     return Signal(
         symbol=symbol,
         exchange=exchange_id,
@@ -139,5 +190,6 @@ def build_signal(symbol: str, exchange_id: str, raw_df, min_risk_reward: float) 
         stop_loss=round(stop_loss, 6),
         take_profit=round(take_profit, 6),
         risk_reward=rr,
+        leverage=leverage,
         reasons=reasons,
-  )
+        )
