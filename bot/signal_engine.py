@@ -1,21 +1,24 @@
 """
-Combines pattern detection + indicators into a scored signal with
-entry zone, stop loss, take profit, and dynamic leverage based on
-confidence score and token volatility (ATR-based).
+Rebuilt signal engine with stricter confluence logic:
 
-Leverage table:
-Confidence   Low Volatility   High Volatility
-70-74%       5x               3x
-75-79%       7x               5x
-80-84%       10x              7x
-85%+         15x              10x
+1. Higher timeframe (1h) trend must agree with signal direction
+2. Support/resistance levels must have minimum 2 touches to qualify
+3. RSI divergence is a strong signal — weighted heavily
+4. Candle body size filter — tiny candles are noise
+5. No contradicting indicators allowed — all must point same direction
 """
 
 from dataclasses import dataclass
 import pandas as pd
 
 from bot.patterns import detect_engulfing, detect_pin_bar
-from bot.indicators import add_indicators, find_support_resistance, nearest_level
+from bot.indicators import (
+    add_indicators,
+    find_support_resistance,
+    nearest_level,
+    detect_rsi_divergence,
+    get_higher_tf_trend,
+)
 
 
 @dataclass
@@ -32,37 +35,15 @@ class Signal:
     reasons: list[str]
 
 
-def _calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
-    """Average True Range — measures recent volatility."""
-    high = df["high"]
-    low = df["low"]
-    close = df["close"].shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - close).abs(),
-        (low - close).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(period).mean().iloc[-1]
-
-
 def _calculate_volatility(df: pd.DataFrame) -> str:
-    """
-    Returns 'high' or 'low' volatility based on ATR as a
-    percentage of current price. Above 2% = high volatility.
-    """
-    atr = _calculate_atr(df)
+    atr = df["atr"].iloc[-1]
     price = df["close"].iloc[-1]
-    if price == 0:
+    if price == 0 or pd.isna(atr):
         return "high"
-    atr_pct = (atr / price) * 100
-    return "high" if atr_pct >= 2.0 else "low"
+    return "high" if (atr / price) * 100 >= 2.0 else "low"
 
 
 def _calculate_leverage(confidence: float, volatility: str) -> int:
-    """
-    Dynamic leverage capped at 15x based on confidence and volatility.
-    Lower confidence or higher volatility = lower leverage.
-    """
     if confidence >= 85:
         return 15 if volatility == "low" else 10
     elif confidence >= 80:
@@ -73,8 +54,26 @@ def _calculate_leverage(confidence: float, volatility: str) -> int:
         return 5 if volatility == "low" else 3
 
 
-def _score_and_direction(df, support_levels, resistance_levels) -> tuple[str | None, float, list[str]]:
-    """Returns (direction, confidence_0_100, reasons)."""
+def _candle_body_is_significant(df: pd.DataFrame) -> bool:
+    """
+    Reject tiny candles — body must be at least 30% of the
+    candle range, otherwise it is noise not a real signal.
+    """
+    last = df.iloc[-1]
+    body = abs(last["close"] - last["open"])
+    candle_range = last["high"] - last["low"]
+    if candle_range == 0:
+        return False
+    return (body / candle_range) >= 0.3
+
+
+def _score_and_direction(
+    df: pd.DataFrame,
+    support_levels: list,
+    resistance_levels: list,
+    higher_tf_trend: str,
+) -> tuple[str | None, float, list[str]]:
+
     last = df.iloc[-1]
     price = last["close"]
     reasons = []
@@ -82,72 +81,95 @@ def _score_and_direction(df, support_levels, resistance_levels) -> tuple[str | N
     short_score = 0
     max_score = 0
 
-    # --- Candle pattern confirmation (worth 30 pts) ---
-    max_score += 30
+    # --- Hard filter 1: Higher timeframe trend ---
+    # Signal direction must match 1h trend, sideways = no trade
+    if higher_tf_trend == "sideways":
+        return None, 0, []
+
+    allowed_direction = "long" if higher_tf_trend == "uptrend" else "short"
+
+    # --- Hard filter 2: Candle body significance ---
+    if not _candle_body_is_significant(df):
+        return None, 0, []
+
+    # --- RSI divergence (worth 35 pts — strongest signal) ---
+    max_score += 35
+    divergence = detect_rsi_divergence(df)
+    if divergence == "bullish" and allowed_direction == "long":
+        long_score += 35
+        reasons.append("Bullish RSI divergence — sellers weakening, reversal up likely")
+    elif divergence == "bearish" and allowed_direction == "short":
+        short_score += 35
+        reasons.append("Bearish RSI divergence — buyers weakening, reversal down likely")
+
+    # --- Candle pattern confirmation (worth 25 pts) ---
+    max_score += 25
     engulf = detect_engulfing(df)
     pin = detect_pin_bar(df)
     pattern = engulf or pin
-    if pattern == "bullish":
-        long_score += 30
-        reasons.append(f"{'Engulfing' if engulf else 'Pin bar'} bullish reversal candle")
-    elif pattern == "bearish":
-        short_score += 30
-        reasons.append(f"{'Engulfing' if engulf else 'Pin bar'} bearish reversal candle")
+    pattern_name = "Engulfing" if engulf else "Pin bar"
+    if pattern == "bullish" and allowed_direction == "long":
+        long_score += 25
+        reasons.append(f"{pattern_name} bullish reversal candle confirmed")
+    elif pattern == "bearish" and allowed_direction == "short":
+        short_score += 25
+        reasons.append(f"{pattern_name} bearish reversal candle confirmed")
 
-    # --- Proximity to support/resistance (worth 25 pts) ---
-    max_score += 25
+    # --- Validated S/R proximity (worth 20 pts) ---
+    # Only levels with 2+ touches qualify (enforced in find_support_resistance)
+    max_score += 20
     near_support = nearest_level(price, support_levels, "below")
     near_resistance = nearest_level(price, resistance_levels, "above")
-    if near_support and abs(price - near_support) / price * 100 <= 0.5:
-        long_score += 25
-        reasons.append(f"Price at support zone ~{near_support:.4f}")
-    if near_resistance and abs(near_resistance - price) / price * 100 <= 0.5:
-        short_score += 25
-        reasons.append(f"Price at resistance zone ~{near_resistance:.4f}")
+    if near_support and abs(price - near_support) / price * 100 <= 0.4:
+        if allowed_direction == "long":
+            long_score += 20
+            reasons.append(f"Price at validated support zone ~{near_support:.4f} (2+ touches)")
+    if near_resistance and abs(near_resistance - price) / price * 100 <= 0.4:
+        if allowed_direction == "short":
+            short_score += 20
+            reasons.append(f"Price at validated resistance zone ~{near_resistance:.4f} (2+ touches)")
 
-    # --- RSI extreme (worth 15 pts) ---
-    max_score += 15
+    # --- RSI extreme confirmation (worth 10 pts) ---
+    max_score += 10
     rsi = last.get("rsi")
     if rsi is not None:
-        if rsi <= 35:
-            long_score += 15
-            reasons.append(f"RSI oversold ({rsi:.1f})")
-        elif rsi >= 65:
-            short_score += 15
-            reasons.append(f"RSI overbought ({rsi:.1f})")
+        if rsi <= 32 and allowed_direction == "long":
+            long_score += 10
+            reasons.append(f"RSI deeply oversold ({rsi:.1f})")
+        elif rsi >= 68 and allowed_direction == "short":
+            short_score += 10
+            reasons.append(f"RSI deeply overbought ({rsi:.1f})")
 
-    # --- MA trend filter (hard filter, not just points) ---
-    # Trend must agree with direction or signal is blocked entirely
-    max_score += 15
-    ma_fast = last.get("ma_fast")
-    ma_mid = last.get("ma_mid")
-    if ma_fast and ma_mid:
-        uptrend = ma_fast > ma_mid and price > ma_fast
-        downtrend = ma_fast < ma_mid and price < ma_fast
+    # --- Volume confirmation (worth 10 pts) ---
+    max_score += 10
+    vol_avg = last.get("vol_avg20")
+    if vol_avg and last["volume"] > vol_avg * 1.5:
+        if allowed_direction == "long":
+            long_score += 10
+        else:
+            short_score += 10
+        reasons.append("Strong volume spike confirms move (>1.5x 20-period average)")
 
-        if uptrend:
-            long_score += 15
-            reasons.append("Uptrend confirmed: price above fast MA, fast MA above mid MA")
-            # Block short signals that go against the uptrend
-            short_score = 0
-        elif downtrend:
-            short_score += 15
-            reasons.append("Downtrend confirmed: price below fast MA, fast MA below mid MA")
-            # Block long signals that go against the downtrend
-            long_score = 0
-        else:
-            # No clear trend — block all signals, choppy market
-            return None, 0, []
-    # --- Volume confirmation (worth 15 pts) ---
-    max_score += 15
-    if last.get("vol_avg20") and last["volume"] > last["vol_avg20"] * 1.3:
-        if long_score >= short_score:
-            long_score += 15
-        else:
-            short_score += 15
-        reasons.append("Volume spike confirms move (>1.3x 20-period average)")
+    # --- Higher timeframe trend bonus (worth 10 pts) ---
+    max_score += 10
+    if higher_tf_trend == "uptrend" and allowed_direction == "long":
+        long_score += 10
+        reasons.append("1H timeframe confirms uptrend")
+    elif higher_tf_trend == "downtrend" and allowed_direction == "short":
+        short_score += 10
+        reasons.append("1H timeframe confirms downtrend")
+
+    # Block any signal going against the allowed direction
+    if allowed_direction == "long":
+        short_score = 0
+    else:
+        long_score = 0
 
     if long_score == 0 and short_score == 0:
+        return None, 0, []
+
+    # Require at least 2 reasons to fire — single-factor signals are noise
+    if len(reasons) < 2:
         return None, 0, []
 
     if long_score >= short_score:
@@ -156,13 +178,19 @@ def _score_and_direction(df, support_levels, resistance_levels) -> tuple[str | N
 
 
 def build_signal(symbol: str, exchange_id: str, raw_df, min_risk_reward: float) -> Signal | None:
-    if raw_df is None or len(raw_df) < 60:
+    if raw_df is None or len(raw_df) < 80:
         return None
 
     df = add_indicators(raw_df)
+
+    # Get higher timeframe trend first — hard filter
+    higher_tf_trend = get_higher_tf_trend(df)
+
     support_levels, resistance_levels = find_support_resistance(df)
 
-    direction, confidence, reasons = _score_and_direction(df, support_levels, resistance_levels)
+    direction, confidence, reasons = _score_and_direction(
+        df, support_levels, resistance_levels, higher_tf_trend
+    )
     if direction is None:
         return None
 
@@ -204,4 +232,4 @@ def build_signal(symbol: str, exchange_id: str, raw_df, min_risk_reward: float) 
         risk_reward=rr,
         leverage=leverage,
         reasons=reasons,
-        )
+    )
