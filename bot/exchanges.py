@@ -11,9 +11,25 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 EXCHANGE_CLASS_MAP = {
-    "bybit": ccxt.bybit,
-    "okx": ccxt.okx,
-    "bingx": ccxt.bingx,
+    "bybit": (ccxt.bybit, {
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": "linear",
+        }
+    }),
+    "okx": (ccxt.okx, {
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": "swap",
+            "defaultSubType": "linear",
+        }
+    }),
+    "bingx": (ccxt.bingx, {
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": "swap",
+        }
+    }),
 }
 
 
@@ -21,12 +37,8 @@ def build_exchange(exchange_id: str):
     """Instantiate a ccxt exchange client configured for USDT perpetual swaps."""
     if exchange_id not in EXCHANGE_CLASS_MAP:
         raise ValueError(f"Unsupported exchange '{exchange_id}'. Add it to EXCHANGE_CLASS_MAP.")
-    klass = EXCHANGE_CLASS_MAP[exchange_id]
-    exchange = klass({
-        "enableRateLimit": True,
-        "options": {"defaultType": "swap"},
-    })
-    return exchange
+    klass, config = EXCHANGE_CLASS_MAP[exchange_id]
+    return klass(config)
 
 
 def get_liquid_perp_symbols(exchange, min_24h_volume_usdt: float) -> list[str]:
