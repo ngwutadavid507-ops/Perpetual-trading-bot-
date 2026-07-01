@@ -116,16 +116,28 @@ def _score_and_direction(df, support_levels, resistance_levels) -> tuple[str | N
             short_score += 15
             reasons.append(f"RSI overbought ({rsi:.1f})")
 
-    # --- MA trend agreement (worth 15 pts) ---
+    # --- MA trend filter (hard filter, not just points) ---
+    # Trend must agree with direction or signal is blocked entirely
     max_score += 15
-    if last.get("ma_fast") and last.get("ma_mid"):
-        if last["ma_fast"] > last["ma_mid"] and price > last["ma_fast"]:
-            long_score += 15
-            reasons.append("Price above fast MA, fast MA above mid MA (uptrend structure)")
-        elif last["ma_fast"] < last["ma_mid"] and price < last["ma_fast"]:
-            short_score += 15
-            reasons.append("Price below fast MA, fast MA below mid MA (downtrend structure)")
+    ma_fast = last.get("ma_fast")
+    ma_mid = last.get("ma_mid")
+    if ma_fast and ma_mid:
+        uptrend = ma_fast > ma_mid and price > ma_fast
+        downtrend = ma_fast < ma_mid and price < ma_fast
 
+        if uptrend:
+            long_score += 15
+            reasons.append("Uptrend confirmed: price above fast MA, fast MA above mid MA")
+            # Block short signals that go against the uptrend
+            short_score = 0
+        elif downtrend:
+            short_score += 15
+            reasons.append("Downtrend confirmed: price below fast MA, fast MA below mid MA")
+            # Block long signals that go against the downtrend
+            long_score = 0
+        else:
+            # No clear trend — block all signals, choppy market
+            return None, 0, []
     # --- Volume confirmation (worth 15 pts) ---
     max_score += 15
     if last.get("vol_avg20") and last["volume"] > last["vol_avg20"] * 1.3:
