@@ -13,6 +13,7 @@ def format_signal_message(sig: Signal) -> str:
     return (
         f"*{arrow} — {sig.symbol}* ({sig.exchange})\n\n"
         f"Confidence: *{sig.confidence}%*\n"
+        f"Leverage: *{sig.leverage}x*\n"
         f"Entry: `{sig.entry}`\n"
         f"Stop Loss: `{sig.stop_loss}`\n"
         f"Take Profit: `{sig.take_profit}`\n"
