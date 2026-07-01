@@ -72,7 +72,7 @@ def get_liquid_perp_symbols(exchange, min_24h_volume_usdt: float) -> list[str]:
         t = tickers.get(symbol)
         if not t:
             continue
-        quote_vol = t.get("quoteVolume") or 0
+        quote_vol = t.get("quoteVolume") or t.get("baseVolume") or 0
         if quote_vol >= min_24h_volume_usdt:
             liquid.append(symbol)
 
