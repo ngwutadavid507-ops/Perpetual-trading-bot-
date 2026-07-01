@@ -56,7 +56,7 @@ def get_liquid_perp_symbols(exchange, min_24h_volume_usdt: float) -> list[str]:
     candidates = [
     symbol for symbol, m in markets.items()
     if m.get("swap") and m.get("linear") and m.get("settle") == "USDT" and m.get("active", True)
-    and not any(fx in symbol for fx in ["NCFX", "EUR", "GBP", "SGD", "JPY", "AUD"])
+    and not any(junk in symbol for junk in ["NC", "EUR", "GBP", "SGD", "JPY", "AUD", "USD2", "2USD"])
     ]
 
     if not candidates:
