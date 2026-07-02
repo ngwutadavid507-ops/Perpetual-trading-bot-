@@ -73,12 +73,16 @@ def _score_and_direction(df, support_levels, resistance_levels):
     max_score += 15
     rsi = last.get("rsi")
     if rsi is not None:
-    if rsi <= 35:
-        long_score += 15
-        reasons.append(f"RSI oversold ({rsi:.1f})")
-    elif rsi >= 65:
-        short_score += 15
-        reasons.append(f"RSI overbought ({rsi:.1f})")
+        if rsi <= 35:
+            long_score += 15
+            reasons.append(f"RSI oversold ({rsi:.1f})")
+        elif rsi >= 65:
+            short_score += 15
+            reasons.append(f"RSI overbought ({rsi:.1f})")
+        if rsi >= 65 and long_score > short_score:
+            return None, 0, []
+        if rsi <= 35 and short_score > long_score:
+            return None, 0, []
     # Hard block — never take LONG when RSI overbought or SHORT when RSI oversold
     if rsi >= 65 and long_score > short_score:
         return None, 0, []
