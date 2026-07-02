@@ -124,36 +124,24 @@ def detect_rsi_divergence(df: pd.DataFrame, lookback: int = 20) -> str | None:
 
 def get_higher_tf_trend(df: pd.DataFrame) -> str:
     """
-    Simulates a higher timeframe trend by resampling the 15m candles
-    into 1h candles and checking MA structure on those.
+    Determines trend using the slow MA on the existing 15m data
+    instead of resampling — more reliable across exchanges.
     Returns 'uptrend', 'downtrend', or 'sideways'.
     """
-    df = df.copy()
-    df = df.set_index("timestamp")
-
-    # Resample to 1h
-    h1 = df.resample("1h").agg({
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-        "volume": "sum"
-    }).dropna()
-
-    if len(h1) < 26:
+    if len(df) < 50:
         return "sideways"
 
-    h1["ma_fast"] = ta.sma(h1["close"], length=7)
-    h1["ma_slow"] = ta.sma(h1["close"], length=25)
-
-    if h1["ma_fast"].isnull().iloc[-1] or h1["ma_slow"].isnull().iloc[-1]:
-        return "sideways"
-
-    last = h1.iloc[-1]
+    last = df.iloc[-1]
+    ma_fast = last.get("ma_fast")
+    ma_mid = last.get("ma_mid")
+    ma_slow = last.get("ma_slow")
     price = last["close"]
 
-    if last["ma_fast"] > last["ma_slow"] and price > last["ma_fast"]:
+    if not all([ma_fast, ma_mid, ma_slow]):
+        return "sideways"
+
+    if ma_fast > ma_mid > ma_slow and price > ma_fast:
         return "uptrend"
-    elif last["ma_fast"] < last["ma_slow"] and price < last["ma_fast"]:
+    elif ma_fast < ma_mid < ma_slow and price < ma_fast:
         return "downtrend"
     return "sideways"
