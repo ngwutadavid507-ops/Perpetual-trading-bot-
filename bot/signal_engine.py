@@ -143,7 +143,7 @@ def _score_and_direction(
     # --- Volume confirmation (worth 10 pts) ---
     max_score += 10
     vol_avg = last.get("vol_avg20")
-    if vol_avg and last["volume"] > vol_avg * 1.5:
+    if vol_avg and last["volume"] > vol_avg * 1.3:
         if allowed_direction == "long":
             long_score += 10
         else:
@@ -169,7 +169,7 @@ def _score_and_direction(
         return None, 0, []
 
     # Require at least 2 reasons to fire — single-factor signals are noise
-    if len(reasons) < 2:
+    if len(reasons) < 1:
         return None, 0, []
 
     if long_score >= short_score:
