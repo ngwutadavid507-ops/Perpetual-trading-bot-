@@ -1,10 +1,3 @@
-"""
-Signal engine with:
-- RSI contradiction fix (no LONG when overbought, no SHORT when oversold)
-- TP1 (partial exit at 1:1 R:R) and TP2 (full target at next S/R)
-- Duplicate prevention via seen_signals cache
-"""
-
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import pandas as pd
@@ -12,8 +5,6 @@ import pandas as pd
 from bot.patterns import detect_engulfing, detect_pin_bar
 from bot.indicators import add_indicators, find_support_resistance, nearest_level
 
-# In-memory cache to prevent duplicate signals
-# Format: {symbol_direction: last_fired_datetime}
 _seen_signals: dict[str, datetime] = {}
 SIGNAL_COOLDOWN_MINUTES = 30
 
@@ -104,13 +95,12 @@ def _score_and_direction(df, support_levels, resistance_levels):
         elif rsi >= 65:
             short_score += 15
             reasons.append(f"RSI overbought ({rsi:.1f})")
-        # Hard block — RSI overbought kills LONG, RSI oversold kills SHORT
         if rsi >= 65 and long_score > short_score:
             return None, 0, []
         if rsi <= 35 and short_score > long_score:
             return None, 0, []
 
-    # --- MA trend as hard filter (15 pts) ---
+    # --- MA trend filter (15 pts) ---
     max_score += 15
     ma_fast = last.get("ma_fast")
     ma_mid = last.get("ma_mid")
@@ -126,7 +116,7 @@ def _score_and_direction(df, support_levels, resistance_levels):
             long_score = 0
             reasons.append("Downtrend confirmed on MA structure")
         else:
-            return None, 0, []
+            pass
 
     # --- Volume (15 pts) ---
     max_score += 15
@@ -157,7 +147,6 @@ def build_signal(symbol: str, exchange_id: str, raw_df, min_risk_reward: float) 
     if direction is None:
         return None
 
-    # Duplicate check — same symbol same direction within cooldown period
     if _is_duplicate(symbol, direction):
         return None
 
@@ -169,14 +158,14 @@ def build_signal(symbol: str, exchange_id: str, raw_df, min_risk_reward: float) 
         entry = price
         stop_loss = recent_swing_low * 0.998
         risk = entry - stop_loss
-        take_profit1 = entry + risk          # 1:1 partial exit
+        take_profit1 = entry + risk
         target_level = nearest_level(price, resistance_levels, "above")
         take_profit2 = target_level if target_level else entry + (risk * 2)
     else:
         entry = price
         stop_loss = recent_swing_high * 1.002
         risk = stop_loss - entry
-        take_profit1 = entry - risk          # 1:1 partial exit
+        take_profit1 = entry - risk
         target_level = nearest_level(price, support_levels, "below")
         take_profit2 = target_level if target_level else entry - (risk * 2)
 
