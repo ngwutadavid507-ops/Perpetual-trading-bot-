@@ -1,8 +1,6 @@
 """
-Unified exchange access using ccxt. Handles fetching tradeable perpetual
-swap symbols and OHLCV candles for OKX and BingX.
-Filters symbols against CoinGecko top list to ensure only high quality
-liquid tokens are scanned.
+Unified exchange access using ccxt. Fetches both 1h and 15m candles
+for multi-timeframe signal analysis.
 """
 
 import logging
@@ -37,21 +35,13 @@ EXCHANGE_CLASS_MAP = {
 
 
 def build_exchange(exchange_id: str):
-    """Instantiate a ccxt exchange client configured for USDT perpetual swaps."""
     if exchange_id not in EXCHANGE_CLASS_MAP:
-        raise ValueError(f"Unsupported exchange '{exchange_id}'. Add it to EXCHANGE_CLASS_MAP.")
+        raise ValueError(f"Unsupported exchange '{exchange_id}'.")
     klass, config = EXCHANGE_CLASS_MAP[exchange_id]
     return klass(config)
 
 
 def get_liquid_perp_symbols(exchange, min_24h_volume_usdt: float) -> list[str]:
-    """
-    Return USDT-margined perpetual swap symbols that:
-    1. Are in the CoinGecko top 200 by market cap
-    2. Clear the 24h volume floor
-    3. Are not synthetic/forex/commodity tokens
-    """
-    # Fetch top list once — cached for 4 hours
     top_symbols = get_top_symbols(limit=200)
 
     try:
@@ -60,7 +50,6 @@ def get_liquid_perp_symbols(exchange, min_24h_volume_usdt: float) -> list[str]:
         logger.error(f"[{exchange.id}] failed to load markets: {e}")
         return []
 
-    # Junk token filter — blocks BingX synthetics and forex pairs
     junk_prefixes = [
         "NC", "EUR", "GBP", "SGD", "JPY",
         "AUD", "USD2", "2USD", "BVOL", "DVOL"
@@ -71,17 +60,11 @@ def get_liquid_perp_symbols(exchange, min_24h_volume_usdt: float) -> list[str]:
         if not (m.get("swap") and m.get("linear") and
                 m.get("settle") == "USDT" and m.get("active", True)):
             continue
-
         base = m.get("base", "").upper()
-
-        # Block junk tokens
         if any(base.startswith(junk) for junk in junk_prefixes):
             continue
-
-        # Only allow top 200 tokens
         if top_symbols and not is_top_symbol(base, top_symbols):
             continue
-
         candidates.append(symbol)
 
     if not candidates:
@@ -91,7 +74,7 @@ def get_liquid_perp_symbols(exchange, min_24h_volume_usdt: float) -> list[str]:
     try:
         tickers = exchange.fetch_tickers(candidates)
     except Exception as e:
-        logger.warning(f"[{exchange.id}] bulk fetch_tickers failed ({e}); skipping volume filter")
+        logger.warning(f"[{exchange.id}] bulk fetch_tickers failed ({e})")
         return candidates
 
     liquid = []
@@ -110,8 +93,12 @@ def get_liquid_perp_symbols(exchange, min_24h_volume_usdt: float) -> list[str]:
     return liquid
 
 
-def fetch_ohlcv_df(exchange, symbol: str, timeframe: str, limit: int = 150) -> pd.DataFrame | None:
-    """Fetch OHLCV candles and return as a pandas DataFrame, or None on failure."""
+def fetch_ohlcv_df(
+    exchange,
+    symbol: str,
+    timeframe: str,
+    limit: int = 150
+) -> pd.DataFrame | None:
     try:
         raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     except Exception as e:
@@ -121,6 +108,22 @@ def fetch_ohlcv_df(exchange, symbol: str, timeframe: str, limit: int = 150) -> p
     if not raw or len(raw) < 50:
         return None
 
-    df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(
+        raw,
+        columns=["timestamp", "open", "high", "low", "close", "volume"]
+    )
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     return df
+
+
+def fetch_dual_timeframe(
+    exchange,
+    symbol: str,
+) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    """
+    Fetches both 1h and 15m candles for a symbol.
+    Returns (df_1h, df_15m) — either can be None if fetch fails.
+    """
+    df_1h = fetch_ohlcv_df(exchange, symbol, "1h", limit=150)
+    df_15m = fetch_ohlcv_df(exchange, symbol, "15m", limit=100)
+    return df_1h, df_15m
