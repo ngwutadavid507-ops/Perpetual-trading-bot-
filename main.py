@@ -15,8 +15,6 @@ logger = logging.getLogger("scanner")
 
 STRICT_BASE_CURRENCIES = {"BTC"}
 tracker = SignalTracker()
-
-# Cache of exchange instances so we can reuse them for price checks
 _exchange_cache: dict = {}
 
 
@@ -60,7 +58,13 @@ async def scan_exchange(exchange_id: str):
         if sig.confidence < threshold:
             continue
 
-        await send_signal(Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID, sig)
+        # Pass df so notifier can generate chart
+        await send_signal(
+            Config.TELEGRAM_BOT_TOKEN,
+            Config.TELEGRAM_CHAT_ID,
+            sig,
+            df=df
+        )
         tracker.add(sig)
         logger.info(f"[{exchange_id}] SIGNAL FIRED: {symbol} {sig.direction} conf={sig.confidence}")
         fired += 1
@@ -72,8 +76,11 @@ async def run_once():
     Config.validate()
     tasks = [scan_exchange(ex) for ex in Config.EXCHANGES]
     await asyncio.gather(*tasks, return_exceptions=True)
-    # Check open signal results after every scan
-    await tracker.check_all(get_current_price, Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID)
+    await tracker.check_all(
+        get_current_price,
+        Config.TELEGRAM_BOT_TOKEN,
+        Config.TELEGRAM_CHAT_ID
+    )
 
 
 async def run_forever():
