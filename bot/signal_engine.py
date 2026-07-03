@@ -5,8 +5,8 @@ import pandas as pd
 from bot.patterns import detect_engulfing, detect_pin_bar
 from bot.indicators import add_indicators, find_support_resistance, nearest_level
 
+# Persistent cooldown cache — keyed by symbol_direction
 _seen_signals: dict[str, datetime] = {}
-SIGNAL_COOLDOWN_MINUTES = 30
 
 
 @dataclass
@@ -21,15 +21,18 @@ class Signal:
     take_profit2: float
     risk_reward1: float
     risk_reward2: float
+    sl_pct: float        # SL distance as % from entry
+    tp1_pct: float       # TP1 distance as % from entry
+    tp2_pct: float       # TP2 distance as % from entry
     leverage: int
     reasons: list[str]
     fired_at: datetime = field(default_factory=datetime.utcnow)
 
 
-def _is_duplicate(symbol: str, direction: str) -> bool:
+def _is_duplicate(symbol: str, direction: str, cooldown_minutes: int) -> bool:
     key = f"{symbol}_{direction}"
     last = _seen_signals.get(key)
-    if last and datetime.utcnow() - last < timedelta(minutes=SIGNAL_COOLDOWN_MINUTES):
+    if last and datetime.utcnow() - last < timedelta(minutes=cooldown_minutes):
         return True
     _seen_signals[key] = datetime.utcnow()
     return False
@@ -136,7 +139,13 @@ def _score_and_direction(df, support_levels, resistance_levels):
     return "short", round(short_score / max_score * 100, 1), reasons
 
 
-def build_signal(symbol: str, exchange_id: str, raw_df, min_risk_reward: float) -> Signal | None:
+def build_signal(
+    symbol: str,
+    exchange_id: str,
+    raw_df,
+    min_risk_reward: float,
+    cooldown_minutes: int = 30
+) -> Signal | None:
     if raw_df is None or len(raw_df) < 60:
         return None
 
@@ -147,7 +156,7 @@ def build_signal(symbol: str, exchange_id: str, raw_df, min_risk_reward: float) 
     if direction is None:
         return None
 
-    if _is_duplicate(symbol, direction):
+    if _is_duplicate(symbol, direction, cooldown_minutes):
         return None
 
     price = df["close"].iloc[-1]
@@ -178,6 +187,11 @@ def build_signal(symbol: str, exchange_id: str, raw_df, min_risk_reward: float) 
     if rr2 < min_risk_reward:
         return None
 
+    # Calculate percentage distances from entry
+    sl_pct = round(abs(entry - stop_loss) / entry * 100, 3)
+    tp1_pct = round(abs(take_profit1 - entry) / entry * 100, 3)
+    tp2_pct = round(abs(take_profit2 - entry) / entry * 100, 3)
+
     volatility = _calculate_volatility(df)
     leverage = _calculate_leverage(confidence, volatility)
 
@@ -192,6 +206,9 @@ def build_signal(symbol: str, exchange_id: str, raw_df, min_risk_reward: float) 
         take_profit2=round(take_profit2, 6),
         risk_reward1=rr1,
         risk_reward2=rr2,
+        sl_pct=sl_pct,
+        tp1_pct=tp1_pct,
+        tp2_pct=tp2_pct,
         leverage=leverage,
         reasons=reasons,
     )
