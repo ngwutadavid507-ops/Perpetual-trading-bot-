@@ -65,22 +65,21 @@ def _calculate_leverage(confidence: float, volatility: str) -> int:
 
 def _get_1h_trend(df_1h: pd.DataFrame) -> str:
     """
-    Determines trend from 1h candles using MA structure.
-    Returns 'uptrend', 'downtrend', or 'sideways'.
+    Relaxed 1h trend detection — only requires fast MA
+    above/below mid MA, not full three-MA stack.
     """
     df = add_indicators(df_1h)
     last = df.iloc[-1]
     price = last["close"]
     ma_fast = last.get("ma_fast")
     ma_mid = last.get("ma_mid")
-    ma_slow = last.get("ma_slow")
 
-    if not all([ma_fast, ma_mid, ma_slow]):
+    if not ma_fast or not ma_mid:
         return "sideways"
 
-    if ma_fast > ma_mid > ma_slow and price > ma_fast:
+    if ma_fast > ma_mid and price > ma_mid:
         return "uptrend"
-    elif ma_fast < ma_mid < ma_slow and price < ma_fast:
+    elif ma_fast < ma_mid and price < ma_mid:
         return "downtrend"
     return "sideways"
 
@@ -150,7 +149,7 @@ def _score_15m(
         # Hard contradiction block
         if rsi >= 70 and allowed_direction == "long":
             return 0, []
-        if rsi <= 30 and allowed_direction == "short":
+        if rsi <= 25 and allowed_direction == "short":
             return 0, []
 
     # --- Volume confirmation (20 pts) ---
