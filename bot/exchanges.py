@@ -1,12 +1,15 @@
 """
 Unified exchange access using ccxt. Handles fetching tradeable perpetual
-swap symbols and OHLCV candles for Bybit, OKX, and BingX (or any other
-ccxt-supported exchange you add to EXCHANGES in .env).
+swap symbols and OHLCV candles for OKX and BingX.
+Filters symbols against CoinGecko top list to ensure only high quality
+liquid tokens are scanned.
 """
 
 import logging
 import ccxt
 import pandas as pd
+
+from bot.toplist import get_top_symbols, is_top_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -43,29 +46,52 @@ def build_exchange(exchange_id: str):
 
 def get_liquid_perp_symbols(exchange, min_24h_volume_usdt: float) -> list[str]:
     """
-    Return USDT-margined perpetual swap symbols on this exchange whose
-    24h quote volume clears the liquidity floor. This is the filter that
-    keeps the bot from firing signals on illiquid, noisy pairs.
+    Return USDT-margined perpetual swap symbols that:
+    1. Are in the CoinGecko top 200 by market cap
+    2. Clear the 24h volume floor
+    3. Are not synthetic/forex/commodity tokens
     """
+    # Fetch top list once — cached for 4 hours
+    top_symbols = get_top_symbols(limit=200)
+
     try:
         markets = exchange.load_markets()
     except Exception as e:
         logger.error(f"[{exchange.id}] failed to load markets: {e}")
         return []
 
-    candidates = [
-    symbol for symbol, m in markets.items()
-    if m.get("swap") and m.get("linear") and m.get("settle") == "USDT" and m.get("active", True)
-    and not any(junk in symbol for junk in ["NC", "EUR", "GBP", "SGD", "JPY", "AUD", "USD2", "2USD"])
+    # Junk token filter — blocks BingX synthetics and forex pairs
+    junk_prefixes = [
+        "NC", "EUR", "GBP", "SGD", "JPY",
+        "AUD", "USD2", "2USD", "BVOL", "DVOL"
     ]
 
+    candidates = []
+    for symbol, m in markets.items():
+        if not (m.get("swap") and m.get("linear") and
+                m.get("settle") == "USDT" and m.get("active", True)):
+            continue
+
+        base = m.get("base", "").upper()
+
+        # Block junk tokens
+        if any(base.startswith(junk) for junk in junk_prefixes):
+            continue
+
+        # Only allow top 200 tokens
+        if top_symbols and not is_top_symbol(base, top_symbols):
+            continue
+
+        candidates.append(symbol)
+
     if not candidates:
+        logger.warning(f"[{exchange.id}] no candidates after top list filter")
         return []
 
     try:
         tickers = exchange.fetch_tickers(candidates)
     except Exception as e:
-        logger.warning(f"[{exchange.id}] bulk fetch_tickers failed ({e}); falling back to no-volume-filter list")
+        logger.warning(f"[{exchange.id}] bulk fetch_tickers failed ({e}); skipping volume filter")
         return candidates
 
     liquid = []
@@ -77,7 +103,10 @@ def get_liquid_perp_symbols(exchange, min_24h_volume_usdt: float) -> list[str]:
         if quote_vol >= min_24h_volume_usdt:
             liquid.append(symbol)
 
-    logger.info(f"[{exchange.id}] {len(liquid)}/{len(candidates)} symbols pass the {min_24h_volume_usdt:,.0f} USDT volume floor")
+    logger.info(
+        f"[{exchange.id}] {len(liquid)}/{len(candidates)} top-200 symbols "
+        f"pass the {min_24h_volume_usdt:,.0f} USDT volume floor"
+    )
     return liquid
 
 
