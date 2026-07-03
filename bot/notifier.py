@@ -10,40 +10,61 @@ logger = logging.getLogger(__name__)
 
 def format_signal_message(sig: Signal) -> str:
     arrow = "🟢 LONG" if sig.direction == "long" else "🔴 SHORT"
-    reasons_block = "\n".join(f"• {r}" for r in sig.reasons)
+    symbol_clean = sig.symbol.replace(":USDT", "").replace("/USDT", "")
 
     if sig.direction == "long":
-        sl_note = f"SL: -{sig.sl_pct}% from entry"
-        tp1_note = f"TP1: +{sig.tp1_pct}% from entry"
-        tp2_note = f"TP2: +{sig.tp2_pct}% from entry"
+        sl_label = f"`{sig.stop_loss}` (-{sig.sl_pct}%)"
+        tp1_label = f"`{sig.take_profit1}` (+{sig.tp1_pct}%)"
+        tp2_label = f"`{sig.take_profit2}` (+{sig.tp2_pct}%)"
     else:
-        sl_note = f"SL: +{sig.sl_pct}% from entry"
-        tp1_note = f"TP1: -{sig.tp1_pct}% from entry"
-        tp2_note = f"TP2: -{sig.tp2_pct}% from entry"
+        sl_label = f"`{sig.stop_loss}` (+{sig.sl_pct}%)"
+        tp1_label = f"`{sig.take_profit1}` (-{sig.tp1_pct}%)"
+        tp2_label = f"`{sig.take_profit2}` (-{sig.tp2_pct}%)"
+
+    reasons_block = "\n".join(f"• {r}" for r in sig.reasons)
 
     return (
-        f"*{arrow} — {sig.symbol}* ({sig.exchange})\n\n"
-        f"Confidence: *{sig.confidence}%*\n"
-        f"Leverage: *{sig.leverage}x*\n\n"
-        f"⚠️ *Enter at current market price*\n"
-        f"Reference price when detected: `{sig.entry}`\n\n"
-        f"📏 *Levels from your entry price:*\n"
-        f"🔴 {sl_note}\n"
-        f"⚡ {tp1_note} (R:R 1:{sig.risk_reward1})\n"
-        f"🎯 {tp2_note} (R:R 1:{sig.risk_reward2})\n\n"
-        f"📋 *Trade Plan:*\n"
-        f"⚡ TP1 = close 50% of position, move SL to entry\n"
-        f"🎯 TP2 = close remaining 50%\n"
-        f"❌ SL hit = exit full position\n\n"
-        f"Reasons:\n{reasons_block}\n\n"
-        f"_Not financial advice. Confirm on your own chart before entering._"
+        f"*{arrow} — {symbol_clean}* ({sig.exchange})\n"
+        f"Confidence: *{sig.confidence}%* | Leverage: *{sig.leverage}x*\n\n"
+        f"Entry:  `{sig.entry}`\n"
+        f"TP1:    {tp1_label}\n"
+        f"TP2:    {tp2_label}\n"
+        f"SL:     {sl_label}\n\n"
+        f"{reasons_block}\n\n"
+        f"_⚠️ Enter at market price — adjust levels from your actual entry_"
     )
+
+
+def format_result_message(symbol: str, direction: str, result: str, pnl_r: float) -> str:
+    symbol_clean = symbol.replace(":USDT", "").replace("/USDT", "")
+    direction_label = "LONG 🟢" if direction == "long" else "SHORT 🔴"
+
+    if result == "tp1":
+        return (
+            f"⚡ *TP1 HIT* — {direction_label} {symbol_clean}\n"
+            f"Result: *+{pnl_r}R* | Move SL to entry now"
+        )
+    elif result == "tp2":
+        return (
+            f"🎯 *TP2 HIT* — {direction_label} {symbol_clean}\n"
+            f"Result: *+{pnl_r}R* | Full target reached ✅"
+        )
+    elif result == "sl":
+        return (
+            f"❌ *SL HIT* — {direction_label} {symbol_clean}\n"
+            f"Result: *{pnl_r}R* | Loss taken"
+        )
+    else:
+        return (
+            f"⏱ *EXPIRED* — {direction_label} {symbol_clean}\n"
+            f"Signal closed without hitting TP or SL"
+        )
 
 
 async def send_signal(bot_token: str, chat_id: str, sig: Signal, df: pd.DataFrame = None):
     bot = Bot(token=bot_token)
 
-    # Send chart image first if df is provided
+    # Send chart first
     if df is not None:
         try:
             from bot.charting import generate_chart
@@ -52,56 +73,28 @@ async def send_signal(bot_token: str, chat_id: str, sig: Signal, df: pd.DataFram
                 await bot.send_photo(
                     chat_id=chat_id,
                     photo=chart_buf,
-                    caption=f"{sig.symbol} — {'LONG 🟢' if sig.direction == 'long' else 'SHORT 🔴'}"
                 )
         except Exception as e:
-            logger.error(f"Failed to send chart: {e}")
+            logger.error(f"Chart send failed: {e}")
 
-    # Send signal text
-    text = format_signal_message(sig)
+    # Send clean signal text
     try:
         await bot.send_message(
             chat_id=chat_id,
-            text=text,
+            text=format_signal_message(sig),
             parse_mode=ParseMode.MARKDOWN
         )
     except Exception as e:
-        logger.error(f"Failed to send signal message: {e}")
+        logger.error(f"Signal message failed: {e}")
 
 
-async def send_result(
-    bot_token: str,
-    chat_id: str,
-    symbol: str,
-    direction: str,
-    result: str,
-    pnl_r: float
-):
+async def send_result(bot_token: str, chat_id: str, symbol: str, direction: str, result: str, pnl_r: float):
     bot = Bot(token=bot_token)
-    if result == "tp1":
-        emoji = "⚡"
-        title = "TP1 HIT — Move SL to entry now"
-    elif result == "tp2":
-        emoji = "🎯"
-        title = "TP2 HIT — Full target reached"
-    elif result == "sl":
-        emoji = "❌"
-        title = "SL HIT — Loss taken"
-    else:
-        emoji = "⏱"
-        title = "Signal expired"
-
-    direction_label = "LONG" if direction == "long" else "SHORT"
-    text = (
-        f"{emoji} *{title}*\n\n"
-        f"Signal: {direction_label} — {symbol}\n"
-        f"Result: *{'+' if pnl_r > 0 else ''}{pnl_r}R*"
-    )
     try:
         await bot.send_message(
             chat_id=chat_id,
-            text=text,
+            text=format_result_message(symbol, direction, result, pnl_r),
             parse_mode=ParseMode.MARKDOWN
         )
     except Exception as e:
-        logger.error(f"Failed to send result message: {e}")
+        logger.error(f"Result message failed: {e}")
