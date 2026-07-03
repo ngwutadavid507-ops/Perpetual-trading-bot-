@@ -1,5 +1,4 @@
 import logging
-import io
 import pandas as pd
 from telegram import Bot
 from telegram.constants import ParseMode
@@ -12,14 +11,26 @@ logger = logging.getLogger(__name__)
 def format_signal_message(sig: Signal) -> str:
     arrow = "🟢 LONG" if sig.direction == "long" else "🔴 SHORT"
     reasons_block = "\n".join(f"• {r}" for r in sig.reasons)
+
+    if sig.direction == "long":
+        sl_note = f"SL: -{sig.sl_pct}% from entry"
+        tp1_note = f"TP1: +{sig.tp1_pct}% from entry"
+        tp2_note = f"TP2: +{sig.tp2_pct}% from entry"
+    else:
+        sl_note = f"SL: +{sig.sl_pct}% from entry"
+        tp1_note = f"TP1: -{sig.tp1_pct}% from entry"
+        tp2_note = f"TP2: -{sig.tp2_pct}% from entry"
+
     return (
         f"*{arrow} — {sig.symbol}* ({sig.exchange})\n\n"
         f"Confidence: *{sig.confidence}%*\n"
         f"Leverage: *{sig.leverage}x*\n\n"
-        f"Entry: `{sig.entry}`\n"
-        f"Stop Loss: `{sig.stop_loss}`\n"
-        f"TP1: `{sig.take_profit1}` (R:R 1:{sig.risk_reward1})\n"
-        f"TP2: `{sig.take_profit2}` (R:R 1:{sig.risk_reward2})\n\n"
+        f"⚠️ *Enter at current market price*\n"
+        f"Reference price when detected: `{sig.entry}`\n\n"
+        f"📏 *Levels from your entry price:*\n"
+        f"🔴 {sl_note}\n"
+        f"⚡ {tp1_note} (R:R 1:{sig.risk_reward1})\n"
+        f"🎯 {tp2_note} (R:R 1:{sig.risk_reward2})\n\n"
         f"📋 *Trade Plan:*\n"
         f"⚡ TP1 = close 50% of position, move SL to entry\n"
         f"🎯 TP2 = close remaining 50%\n"
@@ -58,7 +69,14 @@ async def send_signal(bot_token: str, chat_id: str, sig: Signal, df: pd.DataFram
         logger.error(f"Failed to send signal message: {e}")
 
 
-async def send_result(bot_token: str, chat_id: str, symbol: str, direction: str, result: str, pnl_r: float):
+async def send_result(
+    bot_token: str,
+    chat_id: str,
+    symbol: str,
+    direction: str,
+    result: str,
+    pnl_r: float
+):
     bot = Bot(token=bot_token)
     if result == "tp1":
         emoji = "⚡"
