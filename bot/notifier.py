@@ -1,4 +1,6 @@
 import logging
+import io
+import pandas as pd
 from telegram import Bot
 from telegram.constants import ParseMode
 
@@ -10,16 +12,6 @@ logger = logging.getLogger(__name__)
 def format_signal_message(sig: Signal) -> str:
     arrow = "🟢 LONG" if sig.direction == "long" else "🔴 SHORT"
     reasons_block = "\n".join(f"• {r}" for r in sig.reasons)
-
-    if sig.direction == "long":
-        sl_note = "❌ SL hit = exit full position"
-        tp1_note = "⚡ TP1 = close 50% of position, move SL to entry (risk free)"
-        tp2_note = "🎯 TP2 = close remaining 50%"
-    else:
-        sl_note = "❌ SL hit = exit full position"
-        tp1_note = "⚡ TP1 = close 50% of position, move SL to entry (risk free)"
-        tp2_note = "🎯 TP2 = close remaining 50%"
-
     return (
         f"*{arrow} — {sig.symbol}* ({sig.exchange})\n\n"
         f"Confidence: *{sig.confidence}%*\n"
@@ -29,16 +21,32 @@ def format_signal_message(sig: Signal) -> str:
         f"TP1: `{sig.take_profit1}` (R:R 1:{sig.risk_reward1})\n"
         f"TP2: `{sig.take_profit2}` (R:R 1:{sig.risk_reward2})\n\n"
         f"📋 *Trade Plan:*\n"
-        f"{tp1_note}\n"
-        f"{tp2_note}\n"
-        f"{sl_note}\n\n"
+        f"⚡ TP1 = close 50% of position, move SL to entry\n"
+        f"🎯 TP2 = close remaining 50%\n"
+        f"❌ SL hit = exit full position\n\n"
         f"Reasons:\n{reasons_block}\n\n"
         f"_Not financial advice. Confirm on your own chart before entering._"
     )
 
 
-async def send_signal(bot_token: str, chat_id: str, sig: Signal):
+async def send_signal(bot_token: str, chat_id: str, sig: Signal, df: pd.DataFrame = None):
     bot = Bot(token=bot_token)
+
+    # Send chart image first if df is provided
+    if df is not None:
+        try:
+            from bot.charting import generate_chart
+            chart_buf = generate_chart(df, sig)
+            if chart_buf:
+                await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=chart_buf,
+                    caption=f"{sig.symbol} — {'LONG 🟢' if sig.direction == 'long' else 'SHORT 🔴'}"
+                )
+        except Exception as e:
+            logger.error(f"Failed to send chart: {e}")
+
+    # Send signal text
     text = format_signal_message(sig)
     try:
         await bot.send_message(
@@ -47,7 +55,7 @@ async def send_signal(bot_token: str, chat_id: str, sig: Signal):
             parse_mode=ParseMode.MARKDOWN
         )
     except Exception as e:
-        logger.error(f"Failed to send Telegram message: {e}")
+        logger.error(f"Failed to send signal message: {e}")
 
 
 async def send_result(bot_token: str, chat_id: str, symbol: str, direction: str, result: str, pnl_r: float):
