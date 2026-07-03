@@ -1,8 +1,21 @@
-from dataclasses import dataclass
+"""
+Signal engine with:
+- RSI contradiction fix (no LONG when overbought, no SHORT when oversold)
+- TP1 (partial exit at 1:1 R:R) and TP2 (full target at next S/R)
+- Duplicate prevention via seen_signals cache
+"""
+
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 import pandas as pd
 
 from bot.patterns import detect_engulfing, detect_pin_bar
 from bot.indicators import add_indicators, find_support_resistance, nearest_level
+
+# In-memory cache to prevent duplicate signals
+# Format: {symbol_direction: last_fired_datetime}
+_seen_signals: dict[str, datetime] = {}
+SIGNAL_COOLDOWN_MINUTES = 30
 
 
 @dataclass
@@ -13,16 +26,28 @@ class Signal:
     confidence: float
     entry: float
     stop_loss: float
-    take_profit: float
-    risk_reward: float
+    take_profit1: float
+    take_profit2: float
+    risk_reward1: float
+    risk_reward2: float
     leverage: int
     reasons: list[str]
+    fired_at: datetime = field(default_factory=datetime.utcnow)
+
+
+def _is_duplicate(symbol: str, direction: str) -> bool:
+    key = f"{symbol}_{direction}"
+    last = _seen_signals.get(key)
+    if last and datetime.utcnow() - last < timedelta(minutes=SIGNAL_COOLDOWN_MINUTES):
+        return True
+    _seen_signals[key] = datetime.utcnow()
+    return False
 
 
 def _calculate_volatility(df: pd.DataFrame) -> str:
     atr = df["atr"].iloc[-1] if "atr" in df.columns else None
     price = df["close"].iloc[-1]
-    if not atr or price == 0:
+    if not atr or price == 0 or pd.isna(atr):
         return "high"
     return "high" if (atr / price) * 100 >= 2.0 else "low"
 
@@ -69,7 +94,7 @@ def _score_and_direction(df, support_levels, resistance_levels):
         short_score += 25
         reasons.append(f"Price at resistance zone ~{near_resistance:.4f}")
 
-    # --- RSI (15 pts) ---
+    # --- RSI (15 pts) with hard contradiction block ---
     max_score += 15
     rsi = last.get("rsi")
     if rsi is not None:
@@ -79,15 +104,12 @@ def _score_and_direction(df, support_levels, resistance_levels):
         elif rsi >= 65:
             short_score += 15
             reasons.append(f"RSI overbought ({rsi:.1f})")
+        # Hard block — RSI overbought kills LONG, RSI oversold kills SHORT
         if rsi >= 65 and long_score > short_score:
             return None, 0, []
         if rsi <= 35 and short_score > long_score:
             return None, 0, []
-    # Hard block — never take LONG when RSI overbought or SHORT when RSI oversold
-    if rsi >= 65 and long_score > short_score:
-        return None, 0, []
-    if rsi <= 35 and short_score > long_score:
-        return None, 0, []
+
     # --- MA trend as hard filter (15 pts) ---
     max_score += 15
     ma_fast = last.get("ma_fast")
@@ -103,6 +125,8 @@ def _score_and_direction(df, support_levels, resistance_levels):
             short_score += 15
             long_score = 0
             reasons.append("Downtrend confirmed on MA structure")
+        else:
+            return None, 0, []
 
     # --- Volume (15 pts) ---
     max_score += 15
@@ -133,6 +157,10 @@ def build_signal(symbol: str, exchange_id: str, raw_df, min_risk_reward: float) 
     if direction is None:
         return None
 
+    # Duplicate check — same symbol same direction within cooldown period
+    if _is_duplicate(symbol, direction):
+        return None
+
     price = df["close"].iloc[-1]
     recent_swing_low = df["low"].tail(10).min()
     recent_swing_high = df["high"].tail(10).max()
@@ -140,21 +168,25 @@ def build_signal(symbol: str, exchange_id: str, raw_df, min_risk_reward: float) 
     if direction == "long":
         entry = price
         stop_loss = recent_swing_low * 0.998
+        risk = entry - stop_loss
+        take_profit1 = entry + risk          # 1:1 partial exit
         target_level = nearest_level(price, resistance_levels, "above")
-        take_profit = target_level if target_level else price + (price - stop_loss) * 2
+        take_profit2 = target_level if target_level else entry + (risk * 2)
     else:
         entry = price
         stop_loss = recent_swing_high * 1.002
+        risk = stop_loss - entry
+        take_profit1 = entry - risk          # 1:1 partial exit
         target_level = nearest_level(price, support_levels, "below")
-        take_profit = target_level if target_level else price - (stop_loss - price) * 2
+        take_profit2 = target_level if target_level else entry - (risk * 2)
 
-    risk = abs(entry - stop_loss)
-    reward = abs(take_profit - entry)
     if risk == 0:
         return None
-    rr = round(reward / risk, 2)
 
-    if rr < min_risk_reward:
+    rr1 = round(abs(take_profit1 - entry) / risk, 2)
+    rr2 = round(abs(take_profit2 - entry) / risk, 2)
+
+    if rr2 < min_risk_reward:
         return None
 
     volatility = _calculate_volatility(df)
@@ -167,8 +199,10 @@ def build_signal(symbol: str, exchange_id: str, raw_df, min_risk_reward: float) 
         confidence=confidence,
         entry=round(entry, 6),
         stop_loss=round(stop_loss, 6),
-        take_profit=round(take_profit, 6),
-        risk_reward=rr,
+        take_profit1=round(take_profit1, 6),
+        take_profit2=round(take_profit2, 6),
+        risk_reward1=rr1,
+        risk_reward2=rr2,
         leverage=leverage,
         reasons=reasons,
     )
