@@ -1,35 +1,25 @@
 """
 Generates candlestick chart images for signals.
-Charts include:
-- Last 100 candles of price action
-- MA lines (fast, mid, slow)
-- Entry, TP1, TP2, SL horizontal lines
-- RSI panel below
-- Volume bars
+Uses matplotlib non-interactive backend for server compatibility.
 """
 
 import io
 import logging
 import pandas as pd
-import mplfinance as mpf
+import matplotlib
+matplotlib.use("Agg")  # Non-interactive backend — required on servers
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import mplfinance as mpf
 
 logger = logging.getLogger(__name__)
 
 
 def generate_chart(df: pd.DataFrame, signal) -> io.BytesIO | None:
-    """
-    Generates a chart image for the given signal and returns
-    it as a BytesIO buffer ready to send to Telegram.
-    """
     try:
-        # Use last 100 candles
         chart_df = df.tail(100).copy()
         chart_df = chart_df.set_index("timestamp")
         chart_df.index = pd.DatetimeIndex(chart_df.index)
-
-        # Rename columns to match mplfinance requirements
         chart_df = chart_df.rename(columns={
             "open": "Open",
             "high": "High",
@@ -38,89 +28,63 @@ def generate_chart(df: pd.DataFrame, signal) -> io.BytesIO | None:
             "volume": "Volume",
         })
 
-        # Build additional plots — MA lines
         add_plots = []
 
         if "ma_fast" in df.columns:
-            ma_fast = df["ma_fast"].tail(100).values
-            add_plots.append(
-                mpf.make_addplot(
-                    ma_fast,
-                    color="yellow",
-                    width=1.2,
-                    label="MA7"
-                )
-            )
+            add_plots.append(mpf.make_addplot(
+                df["ma_fast"].tail(100).values,
+                color="#FFD700", width=1.2
+            ))
 
         if "ma_mid" in df.columns:
-            ma_mid = df["ma_mid"].tail(100).values
-            add_plots.append(
-                mpf.make_addplot(
-                    ma_mid,
-                    color="cyan",
-                    width=1.2,
-                    label="MA25"
-                )
-            )
+            add_plots.append(mpf.make_addplot(
+                df["ma_mid"].tail(100).values,
+                color="#00BFFF", width=1.2
+            ))
 
         if "ma_slow" in df.columns:
-            ma_slow = df["ma_slow"].tail(100).values
-            add_plots.append(
-                mpf.make_addplot(
-                    ma_slow,
-                    color="magenta",
-                    width=1.2,
-                    label="MA50"
-                )
-            )
+            add_plots.append(mpf.make_addplot(
+                df["ma_slow"].tail(100).values,
+                color="#FF69B4", width=1.2
+            ))
 
         if "rsi" in df.columns:
-            rsi = df["rsi"].tail(100).values
-            add_plots.append(
-                mpf.make_addplot(
-                    rsi,
-                    panel=2,
-                    color="purple",
-                    width=1.2,
-                    ylabel="RSI",
-                    y_on_right=False,
-                )
-            )
+            add_plots.append(mpf.make_addplot(
+                df["rsi"].tail(100).values,
+                panel=2, color="#9B59B6",
+                width=1.2, ylabel="RSI",
+                y_on_right=False
+            ))
 
-        # Horizontal level lines
-        entry_line = [signal.entry] * 100
-        sl_line = [signal.stop_loss] * 100
-        tp1_line = [signal.take_profit1] * 100
-        tp2_line = [signal.take_profit2] * 100
-
+        n = len(chart_df)
         add_plots += [
-            mpf.make_addplot(entry_line, color="white", width=1.0, linestyle="dashed"),
-            mpf.make_addplot(sl_line, color="red", width=1.2, linestyle="solid"),
-            mpf.make_addplot(tp1_line, color="lightgreen", width=1.2, linestyle="dashed"),
-            mpf.make_addplot(tp2_line, color="lime", width=1.5, linestyle="solid"),
+            mpf.make_addplot([signal.entry] * n, color="#FFFFFF", width=1.0, linestyle="dashed"),
+            mpf.make_addplot([signal.stop_loss] * n, color="#FF4444", width=1.5, linestyle="solid"),
+            mpf.make_addplot([signal.take_profit1] * n, color="#90EE90", width=1.2, linestyle="dashed"),
+            mpf.make_addplot([signal.take_profit2] * n, color="#00FF00", width=1.5, linestyle="solid"),
         ]
 
-        # Chart style
         style = mpf.make_mpf_style(
             base_mpf_style="nightclouds",
-            gridstyle=":",
-            gridcolor="#333333",
             facecolor="#0d1117",
             edgecolor="#30363d",
             figcolor="#0d1117",
+            gridstyle=":",
+            gridcolor="#222222",
             y_on_right=True,
             rc={
-                "axes.labelcolor": "white",
-                "xtick.color": "white",
-                "ytick.color": "white",
+                "axes.labelcolor": "#AAAAAA",
+                "xtick.color": "#AAAAAA",
+                "ytick.color": "#AAAAAA",
                 "text.color": "white",
+                "figure.facecolor": "#0d1117",
             }
         )
 
+        symbol_clean = signal.symbol.replace(":USDT", "").replace("/USDT", "")
         direction_label = "LONG 🟢" if signal.direction == "long" else "SHORT 🔴"
-        title = f"{signal.symbol} | {direction_label} | Conf: {signal.confidence}% | {signal.leverage}x"
+        title = f"{symbol_clean}  |  {direction_label}  |  {signal.confidence}% Confidence  |  {signal.leverage}x"
 
-        # Render chart to buffer
         buf = io.BytesIO()
         mpf.plot(
             chart_df,
@@ -133,21 +97,49 @@ def generate_chart(df: pd.DataFrame, signal) -> io.BytesIO | None:
             figsize=(12, 8),
             savefig=dict(fname=buf, dpi=150, bbox_inches="tight"),
         )
+        plt.close("all")
         buf.seek(0)
 
-        # Add legend manually
-        fig = plt.figure(figsize=(12, 8))
+        # Add legend
+        fig, ax = plt.subplots(figsize=(12, 0.4))
+        fig.patch.set_facecolor("#0d1117")
+        ax.axis("off")
         legend_elements = [
-            mpatches.Patch(color="white", label=f"Entry: {signal.entry}"),
-            mpatches.Patch(color="lightgreen", label=f"TP1: {signal.take_profit1}"),
-            mpatches.Patch(color="lime", label=f"TP2: {signal.take_profit2}"),
-            mpatches.Patch(color="red", label=f"SL: {signal.stop_loss}"),
+            mpatches.Patch(color="white", label=f"Entry {signal.entry}"),
+            mpatches.Patch(color="#90EE90", label=f"TP1 {signal.take_profit1}"),
+            mpatches.Patch(color="#00FF00", label=f"TP2 {signal.take_profit2}"),
+            mpatches.Patch(color="#FF4444", label=f"SL {signal.stop_loss}"),
         ]
-        fig.legend(handles=legend_elements, loc="lower center", ncol=4,
-                   facecolor="#0d1117", labelcolor="white", fontsize=9)
-        plt.close(fig)
+        ax.legend(
+            handles=legend_elements,
+            loc="center", ncol=4,
+            facecolor="#0d1117",
+            labelcolor="white",
+            fontsize=10,
+            framealpha=0.8
+        )
 
-        return buf
+        legend_buf = io.BytesIO()
+        fig.savefig(legend_buf, dpi=150, bbox_inches="tight", facecolor="#0d1117")
+        plt.close("all")
+
+        # Combine chart and legend into one image
+        from PIL import Image
+        buf.seek(0)
+        legend_buf.seek(0)
+        chart_img = Image.open(buf)
+        legend_img = Image.open(legend_buf)
+
+        combined_width = max(chart_img.width, legend_img.width)
+        combined_height = chart_img.height + legend_img.height
+        combined = Image.new("RGB", (combined_width, combined_height), color=(13, 17, 23))
+        combined.paste(chart_img, (0, 0))
+        combined.paste(legend_img, (0, chart_img.height))
+
+        final_buf = io.BytesIO()
+        combined.save(final_buf, format="PNG")
+        final_buf.seek(0)
+        return final_buf
 
     except Exception as e:
         logger.error(f"Chart generation failed for {signal.symbol}: {e}")
