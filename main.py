@@ -50,7 +50,7 @@ async def scan_exchange(exchange_id: str):
         if df is None:
             continue
 
-        sig = build_signal(symbol, exchange_id, df, Config.MIN_RISK_REWARD)
+        sig = build_signal(symbol, exchange_id, df, Config.MIN_RISK_REWARD, Config.SIGNAL_COOLDOWN_MINUTES)
         if sig is None:
             continue
 
