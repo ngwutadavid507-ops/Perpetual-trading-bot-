@@ -4,3 +4,4 @@ pandas-ta>=0.3.14b0
 python-telegram-bot>=21.0
 python-dotenv>=1.0.0
 APScheduler>=3.10.4
+requests>=2.31.0
