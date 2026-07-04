@@ -1,7 +1,7 @@
 """
 Generates candlestick chart images for signals.
-Shows Entry, SL, TP1, TP2, TP3 levels with MA lines and RSI panel.
-Uses matplotlib non-interactive backend for server compatibility.
+Clean dark theme with proper green/red candles,
+integrated volume, and clear TP/SL level lines.
 """
 
 import io
@@ -13,199 +13,157 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-import mplfinance as mpf
-from PIL import Image
+from matplotlib.patches import Rectangle
+import matplotlib.gridspec as gridspec
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
 
 def generate_chart(df: pd.DataFrame, signal) -> io.BytesIO | None:
     try:
-        chart_df = df.tail(100).copy()
-        chart_df = chart_df.set_index("timestamp")
-        chart_df.index = pd.DatetimeIndex(chart_df.index)
-        chart_df = chart_df.rename(columns={
-            "open": "Open",
-            "high": "High",
-            "low": "Low",
-            "close": "Close",
-            "volume": "Volume",
-        })
-
-        n = len(chart_df)
-        add_plots = []
-        has_rsi = False
-
-        # MA lines
-        if "ma_fast" in df.columns:
-            add_plots.append(mpf.make_addplot(
-                df["ma_fast"].tail(100).values,
-                color="#FFD700", width=1.2
-            ))
-
-        if "ma_mid" in df.columns:
-            add_plots.append(mpf.make_addplot(
-                df["ma_mid"].tail(100).values,
-                color="#00BFFF", width=1.2
-            ))
-
-        if "ma_slow" in df.columns:
-            add_plots.append(mpf.make_addplot(
-                df["ma_slow"].tail(100).values,
-                color="#FF69B4", width=1.2
-            ))
-
-        # RSI panel — only add if values are valid
-        if "rsi" in df.columns:
-            rsi_values = df["rsi"].tail(100).values
-            if not pd.isna(rsi_values).all():
-                add_plots.append(mpf.make_addplot(
-                    rsi_values,
-                    panel=2,
-                    color="#9B59B6",
-                    width=1.2,
-                    ylabel="RSI",
-                    y_on_right=False
-                ))
-                has_rsi = True
-
-        # Entry, SL, TP1, TP2, TP3 horizontal lines
-        add_plots += [
-            mpf.make_addplot(
-                [signal.entry] * n,
-                color="#FFFFFF",
-                width=1.0,
-                linestyle="dashed"
-            ),
-            mpf.make_addplot(
-                [signal.stop_loss] * n,
-                color="#FF4444",
-                width=1.5,
-                linestyle="solid"
-            ),
-            mpf.make_addplot(
-                [signal.take_profit1] * n,
-                color="#90EE90",
-                width=1.2,
-                linestyle="dashed"
-            ),
-            mpf.make_addplot(
-                [signal.take_profit2] * n,
-                color="#00CC00",
-                width=1.2,
-                linestyle="dashed"
-            ),
-            mpf.make_addplot(
-                [signal.take_profit3] * n,
-                color="#00FF00",
-                width=1.5,
-                linestyle="solid"
-            ),
-        ]
-
-        style = mpf.make_mpf_style(
-            base_mpf_style="nightclouds",
-            facecolor="#0d1117",
-            edgecolor="#30363d",
-            figcolor="#0d1117",
-            gridstyle=":",
-            gridcolor="#222222",
-            y_on_right=True,
-            rc={
-                "axes.labelcolor": "#AAAAAA",
-                "xtick.color": "#AAAAAA",
-                "ytick.color": "#AAAAAA",
-                "text.color": "white",
-                "figure.facecolor": "#0d1117",
-            }
-        )
+        # Use last 80 candles
+        plot_df = df.tail(80).copy().reset_index(drop=True)
 
         symbol_clean = signal.symbol.replace(":USDT", "").replace("/USDT", "")
         direction_label = "LONG" if signal.direction == "long" else "SHORT"
-        title = (
-            f"{symbol_clean} | {direction_label} | "
-            f"{signal.confidence}% Confidence | {signal.leverage}x Leverage"
+        title = f"{symbol_clean} | {direction_label} | {signal.confidence}% Confidence | {signal.leverage}x Leverage"
+
+        # Colors
+        bg_color = "#131722"
+        up_color = "#26a69a"
+        down_color = "#ef5350"
+        wick_up = "#26a69a"
+        wick_down = "#ef5350"
+        grid_color = "#1e222d"
+        text_color = "#d1d4dc"
+        vol_up = "#26a69a"
+        vol_down = "#ef5350"
+
+        fig = plt.figure(figsize=(14, 8), facecolor=bg_color)
+        gs = gridspec.GridSpec(
+            2, 1,
+            height_ratios=[4, 1],
+            hspace=0.02,
+            figure=fig
         )
 
-        # Set panel ratios based on whether RSI panel exists
-        if has_rsi:
-            panel_ratios = (4, 1, 1)
-        else:
-            panel_ratios = (4, 1)
+        ax = fig.add_subplot(gs[0])
+        ax_vol = fig.add_subplot(gs[1], sharex=ax)
 
-        # Render main chart
-        chart_buf = io.BytesIO()
-        mpf.plot(
-            chart_df,
-            type="candle",
-            style=style,
-            title=title,
-            volume=True,
-            addplot=add_plots,
-            panel_ratios=panel_ratios,
-            figsize=(12, 8),
-            savefig=dict(
-                fname=chart_buf,
-                dpi=100,
-                bbox_inches="tight"
-            ),
-        )
-        plt.close("all")
-        chart_buf.seek(0)
+        ax.set_facecolor(bg_color)
+        ax_vol.set_facecolor(bg_color)
 
-        # Render legend strip
-        fig, ax = plt.subplots(figsize=(12, 0.6))
-        fig.patch.set_facecolor("#0d1117")
-        ax.set_facecolor("#0d1117")
-        ax.axis("off")
+        # Grid
+        ax.grid(color=grid_color, linewidth=0.5, alpha=0.8)
+        ax_vol.grid(color=grid_color, linewidth=0.5, alpha=0.8)
 
-        legend_elements = [
-            mpatches.Patch(color="white", label=f"Entry: {signal.entry}"),
-            mpatches.Patch(color="#90EE90", label=f"TP1: {signal.take_profit1}"),
-            mpatches.Patch(color="#00CC00", label=f"TP2: {signal.take_profit2}"),
-            mpatches.Patch(color="#00FF00", label=f"TP3: {signal.take_profit3}"),
-            mpatches.Patch(color="#FF4444", label=f"SL: {signal.stop_loss}"),
+        # Draw candles manually
+        for i, row in plot_df.iterrows():
+            o, h, l, c = row["open"], row["high"], row["low"], row["close"]
+            color = up_color if c >= o else down_color
+            wick_color = wick_up if c >= o else wick_down
+
+            # Wick
+            ax.plot([i, i], [l, h], color=wick_color, linewidth=0.8, zorder=2)
+
+            # Body
+            body_bottom = min(o, c)
+            body_height = max(abs(c - o), (h - l) * 0.01)
+            rect = Rectangle(
+                (i - 0.4, body_bottom),
+                0.8,
+                body_height,
+                facecolor=color,
+                edgecolor=color,
+                linewidth=0,
+                zorder=3
+            )
+            ax.add_patch(rect)
+
+        # Volume bars
+        for i, row in plot_df.iterrows():
+            color = vol_up if row["close"] >= row["open"] else vol_down
+            ax_vol.bar(i, row["volume"], color=color, alpha=0.7, width=0.8)
+
+        # MA lines
+        x = list(range(len(plot_df)))
+        if "ma_fast" in plot_df.columns:
+            ax.plot(x, plot_df["ma_fast"].values, color="#FFD700", linewidth=1.2, label="MA7", zorder=4)
+        if "ma_mid" in plot_df.columns:
+            ax.plot(x, plot_df["ma_mid"].values, color="#00BFFF", linewidth=1.2, label="MA25", zorder=4)
+        if "ma_slow" in plot_df.columns:
+            ax.plot(x, plot_df["ma_slow"].values, color="#FF69B4", linewidth=1.2, label="MA50", zorder=4)
+
+        # Horizontal level lines
+        n = len(plot_df)
+        ax.axhline(y=signal.entry, color="#FFFFFF", linewidth=1.0, linestyle="--", zorder=5, label=f"Entry {signal.entry}")
+        ax.axhline(y=signal.stop_loss, color="#FF4444", linewidth=1.5, linestyle="-", zorder=5, label=f"SL {signal.stop_loss}")
+        ax.axhline(y=signal.take_profit1, color="#90EE90", linewidth=1.2, linestyle="--", zorder=5, label=f"TP1 {signal.take_profit1}")
+        ax.axhline(y=signal.take_profit2, color="#00CC00", linewidth=1.2, linestyle="--", zorder=5, label=f"TP2 {signal.take_profit2}")
+        ax.axhline(y=signal.take_profit3, color="#00FF00", linewidth=1.5, linestyle="-", zorder=5, label=f"TP3 {signal.take_profit3}")
+
+        # Price labels on right side
+        price_levels = [
+            (signal.stop_loss, "#FF4444", f"SL {signal.stop_loss}"),
+            (signal.entry, "#FFFFFF", f"Entry {signal.entry}"),
+            (signal.take_profit1, "#90EE90", f"TP1 {signal.take_profit1}"),
+            (signal.take_profit2, "#00CC00", f"TP2 {signal.take_profit2}"),
+            (signal.take_profit3, "#00FF00", f"TP3 {signal.take_profit3}"),
         ]
 
-        ax.legend(
-            handles=legend_elements,
-            loc="center",
-            ncol=5,
-            facecolor="#0d1117",
-            labelcolor="white",
-            fontsize=10,
-            framealpha=0.9,
-            edgecolor="#30363d",
+        ax_right = ax.twinx()
+        ax_right.set_facecolor(bg_color)
+        ax_right.set_ylim(ax.get_ylim())
+
+        for price, color, label in price_levels:
+            ax_right.axhline(y=price, color=color, linewidth=0, alpha=0)
+            ax_right.annotate(
+                f" {label}",
+                xy=(1, price),
+                xycoords=("axes fraction", "data"),
+                color=color,
+                fontsize=7.5,
+                fontweight="bold",
+                va="center",
+            )
+
+        # Styling
+        ax.set_title(title, color=text_color, fontsize=11, pad=10, fontweight="bold")
+        ax.tick_params(colors=text_color, labelsize=8)
+        ax_vol.tick_params(colors=text_color, labelsize=7)
+        ax_right.tick_params(colors=text_color, labelsize=0)
+
+        for spine in ax.spines.values():
+            spine.set_edgecolor(grid_color)
+        for spine in ax_vol.spines.values():
+            spine.set_edgecolor(grid_color)
+        for spine in ax_right.spines.values():
+            spine.set_edgecolor(grid_color)
+
+        ax.tick_params(axis="x", which="both", bottom=False, labelbottom=False)
+
+        # X-axis timestamps
+        timestamps = plot_df["timestamp"].dt.strftime("%m/%d %H:%M")
+        tick_positions = list(range(0, len(plot_df), max(1, len(plot_df) // 8)))
+        ax_vol.set_xticks(tick_positions)
+        ax_vol.set_xticklabels(
+            [timestamps.iloc[i] for i in tick_positions],
+            rotation=0,
+            fontsize=7,
+            color=text_color
         )
 
-        legend_buf = io.BytesIO()
-        fig.savefig(
-            legend_buf,
-            dpi=100,
-            bbox_inches="tight",
-            facecolor="#0d1117"
-        )
+        ax.set_xlim(-1, len(plot_df))
+        ax_vol.set_xlim(-1, len(plot_df))
+
+        plt.tight_layout(pad=0.5)
+
+        buf = io.BytesIO()
+        fig.savefig(buf, dpi=120, bbox_inches="tight", facecolor=bg_color)
         plt.close("all")
-        legend_buf.seek(0)
-
-        # Combine chart and legend into one image
-        chart_img = Image.open(chart_buf).convert("RGB")
-        legend_img = Image.open(legend_buf).convert("RGB")
-
-        combined_width = max(chart_img.width, legend_img.width)
-        combined_height = chart_img.height + legend_img.height
-        combined = Image.new(
-            "RGB",
-            (combined_width, combined_height),
-            color=(13, 17, 23)
-        )
-        combined.paste(chart_img, (0, 0))
-        combined.paste(legend_img, (0, chart_img.height))
-
-        final_buf = io.BytesIO()
-        combined.save(final_buf, format="PNG")
-        final_buf.seek(0)
-        return final_buf
+        buf.seek(0)
+        return buf
 
     except Exception as e:
         logger.error(f"Chart generation failed for {signal.symbol}: {e}")
