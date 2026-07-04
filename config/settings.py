@@ -15,7 +15,7 @@ class Config:
     MIN_24H_VOLUME_USDT = float(os.getenv("MIN_24H_VOLUME_USDT", "3000000"))
 
     MIN_CONFIDENCE_DEFAULT = float(os.getenv("MIN_CONFIDENCE_DEFAULT", "60"))
-    MIN_CONFIDENCE_BTC = float(os.getenv("MIN_CONFIDENCE_BTC", "82"))
+    MIN_CONFIDENCE_BTC = float(os.getenv("MIN_CONFIDENCE_BTC", "70"))
 
     SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "600"))
 
