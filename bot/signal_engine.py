@@ -165,15 +165,14 @@ def build_signal(
 ) -> Signal | None:
 
     if df_1h is None or df_15m is None:
+        logger.debug(f"{symbol}: missing df")
         return None
     if len(df_1h) < 50 or len(df_15m) < 50:
+        logger.debug(f"{symbol}: not enough candles")
         return None
 
-    # Get 1h trend — sideways still allowed, just no trend bonus
     trend_1h = _get_1h_trend(df_1h)
 
-    # Determine allowed direction
-    # Sideways: score both directions and pick the stronger one
     if trend_1h == "uptrend":
         directions_to_try = ["long"]
     elif trend_1h == "downtrend":
@@ -190,6 +189,8 @@ def build_signal(
         confidence, reasons = _score_15m(
             df_15m, direction, support_1h, resistance_1h
         )
+        logger.debug(f"{symbol} {direction}: confidence={confidence} reasons={reasons}")
+
         if confidence == 0 or not reasons:
             continue
 
@@ -197,6 +198,7 @@ def build_signal(
             continue
 
         if _is_duplicate(symbol, direction, cooldown_minutes):
+            logger.debug(f"{symbol} {direction}: duplicate blocked")
             continue
 
         df_15m_ind = add_indicators(df_15m)
@@ -209,6 +211,7 @@ def build_signal(
             stop_loss = recent_swing_low * 0.998
             risk = entry - stop_loss
             if risk <= 0:
+                logger.debug(f"{symbol}: risk <= 0")
                 continue
             take_profit1 = entry + risk
             target_1h = nearest_level(price, resistance_1h, "above")
@@ -218,6 +221,7 @@ def build_signal(
             stop_loss = recent_swing_high * 1.002
             risk = stop_loss - entry
             if risk <= 0:
+                logger.debug(f"{symbol}: risk <= 0")
                 continue
             take_profit1 = entry - risk
             target_1h = nearest_level(price, support_1h, "below")
@@ -227,6 +231,7 @@ def build_signal(
         rr2 = round(abs(take_profit2 - entry) / risk, 2)
 
         if rr2 < min_risk_reward:
+            logger.debug(f"{symbol}: rr2={rr2} below min {min_risk_reward}")
             continue
 
         sl_pct = round(abs(entry - stop_loss) / entry * 100, 3)
