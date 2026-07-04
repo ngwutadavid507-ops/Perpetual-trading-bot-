@@ -1,100 +1,307 @@
 """
-Fetches the top N cryptocurrencies by market cap from CoinGecko's
-free API (no API key required). Used to filter exchange symbols so
-the bot only scans high quality, liquid, well-known tokens.
-
-The list refreshes every 4 hours to stay current without hammering
-the free tier rate limits.
+Multi-timeframe signal engine with 3 TP levels.
+- 1h candles: trend direction and S/R zones
+- 15m candles: entry timing, pattern confirmation
+- TP1 = 3x risk, TP2 = 5x risk, TP3 = 7x risk (or next 1H S/R)
+- SL placed beyond the invalidation swing point
+- Signal quality enhanced to ensure SL is tight enough
+  to make 3x/5x/7x targets realistic
 """
 
-import logging
-import time
-import requests
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+import pandas as pd
 
-logger = logging.getLogger(__name__)
+from bot.patterns import detect_engulfing, detect_pin_bar
+from bot.indicators import add_indicators, find_support_resistance, nearest_level
 
-# Cache: (timestamp, set of base currency symbols)
-_cache: tuple[float, set[str]] | None = None
-CACHE_TTL_SECONDS = 4 * 60 * 60  # refresh every 4 hours
+_seen_signals: dict[str, datetime] = {}
 
 
-def get_top_symbols(limit: int = 200) -> set[str]:
+@dataclass
+class Signal:
+    symbol: str
+    exchange: str
+    direction: str
+    confidence: float
+    entry: float
+    stop_loss: float
+    take_profit1: float
+    take_profit2: float
+    take_profit3: float
+    sl_pct: float
+    tp1_pct: float
+    tp2_pct: float
+    tp3_pct: float
+    leverage: int
+    reasons: list[str]
+    fired_at: datetime = field(default_factory=datetime.utcnow)
+
+
+def _is_duplicate(symbol: str, direction: str, cooldown_minutes: int) -> bool:
+    key = f"{symbol}_{direction}"
+    last = _seen_signals.get(key)
+    if last and datetime.utcnow() - last < timedelta(minutes=cooldown_minutes):
+        return True
+    _seen_signals[key] = datetime.utcnow()
+    return False
+
+
+def _calculate_volatility(df: pd.DataFrame) -> str:
+    atr = df["atr"].iloc[-1] if "atr" in df.columns else None
+    price = df["close"].iloc[-1]
+    if not atr or price == 0 or pd.isna(atr):
+        return "high"
+    return "high" if (atr / price) * 100 >= 2.0 else "low"
+
+
+def _calculate_leverage(confidence: float, volatility: str) -> int:
+    if confidence >= 85:
+        return 15 if volatility == "low" else 10
+    elif confidence >= 80:
+        return 10 if volatility == "low" else 7
+    elif confidence >= 75:
+        return 7 if volatility == "low" else 5
+    else:
+        return 5 if volatility == "low" else 3
+
+
+def _get_1h_trend(df_1h: pd.DataFrame) -> str:
+    df = add_indicators(df_1h)
+    last = df.iloc[-1]
+    price = last["close"]
+    ma_fast = last.get("ma_fast")
+    ma_mid = last.get("ma_mid")
+    if not ma_fast or not ma_mid:
+        return "sideways"
+    if ma_fast > ma_mid and price > ma_mid:
+        return "uptrend"
+    elif ma_fast < ma_mid and price < ma_mid:
+        return "downtrend"
+    return "sideways"
+
+
+def _get_1h_levels(df_1h: pd.DataFrame) -> tuple[list, list]:
+    df = add_indicators(df_1h)
+    return find_support_resistance(df, lookback=80)
+
+
+def _calculate_sl(
+    df_15m: pd.DataFrame,
+    direction: str,
+    entry: float,
+    max_sl_pct: float = 1.5,
+) -> float | None:
     """
-    Returns a set of base currency symbols for the top N coins
-    by market cap e.g. {'BTC', 'ETH', 'SOL', 'BNB', ...}
+    Calculates a tight SL beyond the nearest swing point.
+    Rejects the signal if SL is more than max_sl_pct away from entry
+    — this ensures TP targets at 3x/5x/7x are realistic.
     """
-    global _cache
+    recent_low = df_15m["low"].tail(10).min()
+    recent_high = df_15m["high"].tail(10).max()
 
-    # Return cached list if still fresh
-    if _cache is not None:
-        cached_at, symbols = _cache
-        if time.time() - cached_at < CACHE_TTL_SECONDS:
-            logger.info(f"[toplist] using cached list ({len(symbols)} symbols)")
-            return symbols
+    if direction == "long":
+        sl = recent_low * 0.998
+        sl_pct = abs(entry - sl) / entry * 100
+        if sl_pct > max_sl_pct:
+            # Try tighter — use last 5 candles only
+            sl = df_15m["low"].tail(5).min() * 0.999
+            sl_pct = abs(entry - sl) / entry * 100
+            if sl_pct > max_sl_pct:
+                return None
+    else:
+        sl = recent_high * 1.002
+        sl_pct = abs(sl - entry) / entry * 100
+        if sl_pct > max_sl_pct:
+            sl = df_15m["high"].tail(5).max() * 1.001
+            sl_pct = abs(sl - entry) / entry * 100
+            if sl_pct > max_sl_pct:
+                return None
 
-    symbols = _fetch_from_coingecko(limit)
-
-    if not symbols:
-        # If fetch failed and we have a stale cache, use it rather than blocking all scans
-        if _cache is not None:
-            logger.warning("[toplist] fetch failed, using stale cache")
-            return _cache[1]
-        # No cache at all — return empty set so caller can decide what to do
-        logger.error("[toplist] fetch failed and no cache available")
-        return set()
-
-    _cache = (time.time(), symbols)
-    logger.info(f"[toplist] refreshed — {len(symbols)} top symbols loaded")
-    return symbols
-
-
-def _fetch_from_coingecko(limit: int) -> set[str]:
-    """
-    Calls CoinGecko free API to get top coins by market cap.
-    No API key needed for this endpoint.
-    Handles pagination since CoinGecko returns max 250 per page.
-    """
-    symbols = set()
-    per_page = min(limit, 250)
-    page = 1
-
-    while len(symbols) < limit:
-        try:
-            url = "https://api.coingecko.com/api/v3/coins/markets"
-            params = {
-                "vs_currency": "usd",
-                "order": "market_cap_desc",
-                "per_page": per_page,
-                "page": page,
-                "sparkline": False,
-            }
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-
-            if not data:
-                break
-
-            for coin in data:
-                symbol = coin.get("symbol", "").upper()
-                if symbol:
-                    symbols.add(symbol)
-
-            if len(data) < per_page:
-                break
-
-            page += 1
-
-        except requests.exceptions.RequestException as e:
-            logger.error(f"[toplist] CoinGecko request failed: {e}")
-            break
-        except Exception as e:
-            logger.error(f"[toplist] unexpected error: {e}")
-            break
-
-    return symbols
+    return round(sl, 6)
 
 
-def is_top_symbol(base_currency: str, top_symbols: set[str]) -> bool:
-    """Check if a base currency is in the top list."""
-    return base_currency.upper() in top_symbols
+def _score_15m(
+    df_15m: pd.DataFrame,
+    allowed_direction: str,
+    support_1h: list,
+    resistance_1h: list,
+) -> tuple[float, list[str]]:
+    df = add_indicators(df_15m)
+    last = df.iloc[-1]
+    price = last["close"]
+    score = 0
+    max_score = 0
+    reasons = []
+
+    # --- 15m candle pattern (30 pts) ---
+    max_score += 30
+    engulf = detect_engulfing(df)
+    pin = detect_pin_bar(df)
+    pattern = engulf or pin
+    pattern_name = "Engulfing" if engulf else "Pin bar"
+    if pattern == "bullish" and allowed_direction == "long":
+        score += 30
+        reasons.append(f"{pattern_name} bullish reversal on 15m")
+    elif pattern == "bearish" and allowed_direction == "short":
+        score += 30
+        reasons.append(f"{pattern_name} bearish reversal on 15m")
+
+    # No pattern at all — not worth scoring further
+    if score == 0:
+        return 0, []
+
+    # --- 1h S/R proximity (25 pts) ---
+    max_score += 25
+    near_support = nearest_level(price, support_1h, "below")
+    near_resistance = nearest_level(price, resistance_1h, "above")
+    if near_support and abs(price - near_support) / price * 100 <= 1.0:
+        if allowed_direction == "long":
+            score += 25
+            reasons.append(f"1H support zone ~{near_support:.4f}")
+    if near_resistance and abs(near_resistance - price) / price * 100 <= 1.0:
+        if allowed_direction == "short":
+            score += 25
+            reasons.append(f"1H resistance zone ~{near_resistance:.4f}")
+
+    # --- RSI confirmation (20 pts) ---
+    max_score += 20
+    rsi = last.get("rsi")
+    if rsi is not None:
+        if rsi <= 40 and allowed_direction == "long":
+            score += 20
+            reasons.append(f"RSI oversold ({rsi:.1f})")
+        elif rsi >= 60 and allowed_direction == "short":
+            score += 20
+            reasons.append(f"RSI overbought ({rsi:.1f})")
+        # Hard contradiction block
+        if rsi >= 75 and allowed_direction == "long":
+            return 0, []
+        if rsi <= 25 and allowed_direction == "short":
+            return 0, []
+
+    # --- 15m MA structure (15 pts) ---
+    max_score += 15
+    ma_fast = last.get("ma_fast")
+    ma_mid = last.get("ma_mid")
+    if ma_fast and ma_mid:
+        if ma_fast > ma_mid and price > ma_fast and allowed_direction == "long":
+            score += 15
+            reasons.append("15m uptrend structure confirmed")
+        elif ma_fast < ma_mid and price < ma_fast and allowed_direction == "short":
+            score += 15
+            reasons.append("15m downtrend structure confirmed")
+
+    # --- Volume confirmation (10 pts) ---
+    max_score += 10
+    vol_avg = last.get("vol_avg20")
+    if vol_avg and last["volume"] > vol_avg * 1.3:
+        score += 10
+        reasons.append("Volume spike confirms move")
+
+    if not reasons:
+        return 0, []
+
+    return round(score / max_score * 100, 1), reasons
+
+
+def build_signal(
+    symbol: str,
+    exchange_id: str,
+    df_1h: pd.DataFrame,
+    df_15m: pd.DataFrame,
+    min_risk_reward: float,
+    cooldown_minutes: int = 30,
+) -> Signal | None:
+
+    if df_1h is None or df_15m is None:
+        return None
+    if len(df_1h) < 50 or len(df_15m) < 50:
+        return None
+
+    # Step 1 — 1H trend
+    trend_1h = _get_1h_trend(df_1h)
+    if trend_1h == "uptrend":
+        directions_to_try = ["long"]
+    elif trend_1h == "downtrend":
+        directions_to_try = ["short"]
+    else:
+        directions_to_try = ["long", "short"]
+
+    # Step 2 — 1H S/R levels
+    support_1h, resistance_1h = _get_1h_levels(df_1h)
+
+    df_15m_ind = add_indicators(df_15m)
+    best_sig = None
+    best_confidence = 0
+
+    for direction in directions_to_try:
+        # Step 3 — score 15m setup
+        confidence, reasons = _score_15m(
+            df_15m, direction, support_1h, resistance_1h
+        )
+        if confidence == 0 or not reasons:
+            continue
+
+        if confidence <= best_confidence:
+            continue
+
+        # Step 4 — duplicate check
+        if _is_duplicate(symbol, direction, cooldown_minutes):
+            continue
+
+        price = df_15m_ind["close"].iloc[-1]
+
+        # Step 5 — calculate tight SL (max 1.5% from entry)
+        stop_loss = _calculate_sl(df_15m_ind, direction, price, max_sl_pct=1.5)
+        if stop_loss is None:
+            continue
+
+        risk = abs(price - stop_loss)
+        if risk == 0:
+            continue
+
+        # Step 6 — calculate TP1, TP2, TP3 at 3x, 5x, 7x risk
+        if direction == "long":
+            entry = price
+            take_profit1 = round(entry + (risk * 3), 6)
+            take_profit2 = round(entry + (risk * 5), 6)
+            take_profit3 = round(entry + (risk * 7), 6)
+        else:
+            entry = price
+            take_profit1 = round(entry - (risk * 3), 6)
+            take_profit2 = round(entry - (risk * 5), 6)
+            take_profit3 = round(entry - (risk * 7), 6)
+
+        sl_pct = round(abs(entry - stop_loss) / entry * 100, 3)
+        tp1_pct = round(abs(take_profit1 - entry) / entry * 100, 3)
+        tp2_pct = round(abs(take_profit2 - entry) / entry * 100, 3)
+        tp3_pct = round(abs(take_profit3 - entry) / entry * 100, 3)
+
+        # Add trend reason at top
+        if trend_1h != "sideways":
+            reasons.insert(0, f"1H {trend_1h} confirmed")
+
+        volatility = _calculate_volatility(df_15m_ind)
+        leverage = _calculate_leverage(confidence, volatility)
+
+        best_confidence = confidence
+        best_sig = Signal(
+            symbol=symbol,
+            exchange=exchange_id,
+            direction=direction,
+            confidence=confidence,
+            entry=round(entry, 6),
+            stop_loss=stop_loss,
+            take_profit1=take_profit1,
+            take_profit2=take_profit2,
+            take_profit3=take_profit3,
+            sl_pct=sl_pct,
+            tp1_pct=tp1_pct,
+            tp2_pct=tp2_pct,
+            tp3_pct=tp3_pct,
+            leverage=leverage,
+            reasons=reasons,
+        )
+
+    return best_sig
