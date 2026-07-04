@@ -1,6 +1,7 @@
 """
 Unified exchange access using ccxt. Fetches both 1h and 15m candles
-for multi-timeframe signal analysis.
+for multi-timeframe signal analysis. Filters out options, futures with
+expiry, and synthetic/forex tokens. Only scans USDT linear perpetual swaps.
 """
 
 import logging
@@ -57,18 +58,45 @@ def get_liquid_perp_symbols(exchange, min_24h_volume_usdt: float) -> list[str]:
 
     candidates = []
     for symbol, m in markets.items():
-        if not (m.get("swap") and m.get("linear") and
-                m.get("settle") == "USDT" and m.get("active", True)):
+
+        # Must be a linear USDT-settled perpetual swap
+        if not m.get("swap"):
             continue
+        if not m.get("linear"):
+            continue
+        if m.get("settle") != "USDT":
+            continue
+        if not m.get("active", True):
+            continue
+
+        # Block options contracts
+        if m.get("type") == "option":
+            continue
+
+        # Block any contract with an expiry date — only true perpetuals
+        if m.get("expiry") is not None:
+            continue
+        if m.get("expiryDatetime") is not None:
+            continue
+
+        # Block futures (dated contracts)
+        if m.get("future") and not m.get("swap"):
+            continue
+
         base = m.get("base", "").upper()
+
+        # Block junk/synthetic/forex tokens
         if any(base.startswith(junk) for junk in junk_prefixes):
             continue
+
+        # Only allow top 200 tokens by market cap
         if top_symbols and not is_top_symbol(base, top_symbols):
             continue
+
         candidates.append(symbol)
 
     if not candidates:
-        logger.warning(f"[{exchange.id}] no candidates after top list filter")
+        logger.warning(f"[{exchange.id}] no candidates after filtering")
         return []
 
     try:
@@ -87,7 +115,7 @@ def get_liquid_perp_symbols(exchange, min_24h_volume_usdt: float) -> list[str]:
             liquid.append(symbol)
 
     logger.info(
-        f"[{exchange.id}] {len(liquid)}/{len(candidates)} top-200 symbols "
+        f"[{exchange.id}] {len(liquid)}/{len(candidates)} top-200 perp symbols "
         f"pass the {min_24h_volume_usdt:,.0f} USDT volume floor"
     )
     return liquid
