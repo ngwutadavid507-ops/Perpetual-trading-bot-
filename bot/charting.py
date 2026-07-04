@@ -34,6 +34,7 @@ def generate_chart(df: pd.DataFrame, signal) -> io.BytesIO | None:
 
         n = len(chart_df)
         add_plots = []
+        has_rsi = False
 
         # MA lines
         if "ma_fast" in df.columns:
@@ -54,17 +55,19 @@ def generate_chart(df: pd.DataFrame, signal) -> io.BytesIO | None:
                 color="#FF69B4", width=1.2
             ))
 
-        # RSI panel
+        # RSI panel — only add if values are valid
         if "rsi" in df.columns:
             rsi_values = df["rsi"].tail(100).values
-            add_plots.append(mpf.make_addplot(
-                rsi_values,
-                panel=2,
-                color="#9B59B6",
-                width=1.2,
-                ylabel="RSI",
-                y_on_right=False
-            ))
+            if not pd.isna(rsi_values).all():
+                add_plots.append(mpf.make_addplot(
+                    rsi_values,
+                    panel=2,
+                    color="#9B59B6",
+                    width=1.2,
+                    ylabel="RSI",
+                    y_on_right=False
+                ))
+                has_rsi = True
 
         # Entry, SL, TP1, TP2, TP3 horizontal lines
         add_plots += [
@@ -124,6 +127,12 @@ def generate_chart(df: pd.DataFrame, signal) -> io.BytesIO | None:
             f"{signal.confidence}% Confidence | {signal.leverage}x Leverage"
         )
 
+        # Set panel ratios based on whether RSI panel exists
+        if has_rsi:
+            panel_ratios = (4, 1, 1)
+        else:
+            panel_ratios = (4, 1)
+
         # Render main chart
         chart_buf = io.BytesIO()
         mpf.plot(
@@ -133,7 +142,7 @@ def generate_chart(df: pd.DataFrame, signal) -> io.BytesIO | None:
             title=title,
             volume=True,
             addplot=add_plots,
-            panel_ratios=(4, 1, 1),
+            panel_ratios=panel_ratios,
             figsize=(12, 8),
             savefig=dict(
                 fname=chart_buf,
