@@ -14,7 +14,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("scanner")
 
-STRICT_BASE_CURRENCIES = {"BTC"}
+STRICT_BASE_CURRENCIES = set()
 tracker = SignalTracker()
 _exchange_cache: dict = {}
 
