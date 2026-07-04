@@ -2,7 +2,7 @@ import asyncio
 import logging
 
 from config.settings import Config
-from bot.exchanges import build_exchange, get_liquid_perp_symbols, fetch_ohlcv_df
+from bot.exchanges import build_exchange, get_liquid_perp_symbols, fetch_dual_timeframe
 from bot.signal_engine import build_signal
 from bot.notifier import send_signal
 from bot.tracker import SignalTracker
@@ -45,31 +45,52 @@ async def scan_exchange(exchange_id: str):
     logger.info(f"[{exchange_id}] scanning {len(symbols)} liquid symbols")
 
     fired = 0
+    skipped = 0
+
     for symbol in symbols:
-        df = fetch_ohlcv_df(exchange, symbol, Config.TIMEFRAME)
-        if df is None:
+        try:
+            df_1h, df_15m = fetch_dual_timeframe(exchange, symbol)
+
+            if df_1h is None or df_15m is None:
+                skipped += 1
+                continue
+
+            sig = build_signal(
+                symbol,
+                exchange_id,
+                df_1h,
+                df_15m,
+                Config.MIN_RISK_REWARD,
+                Config.SIGNAL_COOLDOWN_MINUTES,
+            )
+            if sig is None:
+                continue
+
+            threshold = required_confidence(symbol)
+            if sig.confidence < threshold:
+                continue
+
+            await send_signal(
+                Config.TELEGRAM_BOT_TOKEN,
+                Config.TELEGRAM_CHAT_ID,
+                sig,
+                df=df_15m,
+            )
+            tracker.add(sig)
+            logger.info(
+                f"[{exchange_id}] SIGNAL FIRED: {symbol} "
+                f"{sig.direction} conf={sig.confidence}"
+            )
+            fired += 1
+
+        except Exception as e:
+            logger.error(f"[{exchange_id}] error processing {symbol}: {e}")
             continue
 
-        sig = build_signal(symbol, exchange_id, df, Config.MIN_RISK_REWARD, Config.SIGNAL_COOLDOWN_MINUTES)
-        if sig is None:
-            continue
-
-        threshold = required_confidence(symbol)
-        if sig.confidence < threshold:
-            continue
-
-        # Pass df so notifier can generate chart
-        await send_signal(
-            Config.TELEGRAM_BOT_TOKEN,
-            Config.TELEGRAM_CHAT_ID,
-            sig,
-            df=df
-        )
-        tracker.add(sig)
-        logger.info(f"[{exchange_id}] SIGNAL FIRED: {symbol} {sig.direction} conf={sig.confidence}")
-        fired += 1
-
-    logger.info(f"[{exchange_id}] scan complete, {fired} signals fired")
+    logger.info(
+        f"[{exchange_id}] scan complete — {fired} signals fired, "
+        f"{skipped} symbols skipped (no data)"
+    )
 
 
 async def run_once():
@@ -79,7 +100,7 @@ async def run_once():
     await tracker.check_all(
         get_current_price,
         Config.TELEGRAM_BOT_TOKEN,
-        Config.TELEGRAM_CHAT_ID
+        Config.TELEGRAM_CHAT_ID,
     )
 
 
