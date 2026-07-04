@@ -146,7 +146,7 @@ def generate_chart(df: pd.DataFrame, signal) -> io.BytesIO | None:
             figsize=(12, 8),
             savefig=dict(
                 fname=chart_buf,
-                dpi=150,
+                dpi=100,
                 bbox_inches="tight"
             ),
         )
@@ -181,7 +181,7 @@ def generate_chart(df: pd.DataFrame, signal) -> io.BytesIO | None:
         legend_buf = io.BytesIO()
         fig.savefig(
             legend_buf,
-            dpi=150,
+            dpi=100,
             bbox_inches="tight",
             facecolor="#0d1117"
         )
