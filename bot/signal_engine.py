@@ -1,10 +1,13 @@
 """
 Multi-timeframe signal engine with 3 TP levels.
-- 1h candles: trend direction and S/R zones
+- 1h candles: trend direction and validated S/R zones
 - 15m candles: entry timing, pattern confirmation
 - TP1 = 3x risk, TP2 = 5x risk, TP3 = 7x risk
 - SL placed beyond the invalidation swing point
-- Persistent duplicate cache survives Railway restarts
+- BTC treated same as all other tokens
+- S/R levels require minimum 2 touches to qualify
+- Candle must be significant relative to recent ATR
+- Signal must form after an impulse move not in chop
 """
 
 import os
@@ -13,6 +16,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import pandas as pd
+import numpy as np
 
 from bot.patterns import detect_engulfing, detect_pin_bar
 from bot.indicators import add_indicators, find_support_resistance, nearest_level
@@ -115,9 +119,55 @@ def _get_1h_trend(df_1h: pd.DataFrame) -> str:
 
 
 def _get_1h_levels(df_1h: pd.DataFrame) -> tuple[list, list]:
-    """Gets support and resistance levels from 1h candles."""
+    """
+    Gets validated S/R levels from 1h candles.
+    Only levels touched at least twice qualify.
+    """
     df = add_indicators(df_1h)
-    return find_support_resistance(df, lookback=80)
+    support, resistance = find_support_resistance(df, lookback=80)
+    return support, resistance
+
+
+def _is_after_impulse(df_15m: pd.DataFrame, direction: str) -> bool:
+    """
+    Checks if price has made a meaningful move before the signal candle.
+    Prevents signals forming in the middle of choppy sideways price action.
+    Looks at the last 5 candles before signal — if they moved at least
+    0.5x ATR in the signal direction, it qualifies as an impulse.
+    Kept loose so it doesn't block too many signals.
+    """
+    if "atr" not in df_15m.columns:
+        return True
+
+    atr = df_15m["atr"].iloc[-1]
+    if pd.isna(atr) or atr == 0:
+        return True
+
+    recent = df_15m.tail(6).iloc[:-1]
+    if direction == "short":
+        move = recent["close"].iloc[0] - recent["close"].iloc[-1]
+    else:
+        move = recent["close"].iloc[-1] - recent["close"].iloc[0]
+
+    return move >= atr * 0.5
+
+
+def _candle_is_significant(df_15m: pd.DataFrame) -> bool:
+    """
+    Signal candle body must be at least 20% of recent ATR.
+    Filters out tiny doji-like candles that are just noise.
+    Kept loose at 20% to avoid blocking too many signals.
+    """
+    if "atr" not in df_15m.columns:
+        return True
+
+    last = df_15m.iloc[-1]
+    atr = df_15m["atr"].iloc[-1]
+    if pd.isna(atr) or atr == 0:
+        return True
+
+    body = abs(last["close"] - last["open"])
+    return body >= atr * 0.2
 
 
 def _calculate_sl(df_15m: pd.DataFrame, direction: str) -> float:
@@ -141,7 +191,6 @@ def _score_15m(
     """
     Scores the 15m setup in the allowed direction.
     Returns (confidence_0_to_100, reasons).
-    Requires a candle pattern to fire — no pattern, no signal.
     """
     df = add_indicators(df_15m)
     last = df.iloc[-1]
@@ -149,6 +198,10 @@ def _score_15m(
     score = 0
     max_score = 0
     reasons = []
+
+    # --- Candle significance check ---
+    if not _candle_is_significant(df):
+        return 0, []
 
     # --- Candle pattern (30 pts) — required ---
     max_score += 30
@@ -164,7 +217,10 @@ def _score_15m(
         score += 30
         reasons.append(f"{pattern_name} bearish reversal on 15m")
     else:
-        # No matching pattern — block signal entirely
+        return 0, []
+
+    # --- Impulse move check ---
+    if not _is_after_impulse(df, allowed_direction):
         return 0, []
 
     # --- 1H S/R proximity (25 pts) ---
@@ -173,31 +229,29 @@ def _score_15m(
     near_resistance = nearest_level(price, resistance_1h, "above")
 
     if allowed_direction == "long" and near_support:
-        if abs(price - near_support) / price * 100 <= 1.0:
+        if abs(price - near_support) / price * 100 <= 1.2:
             score += 25
             reasons.append(f"1H support zone ~{near_support:.4f}")
 
     if allowed_direction == "short" and near_resistance:
-        if abs(near_resistance - price) / price * 100 <= 1.0:
+        if abs(near_resistance - price) / price * 100 <= 1.2:
             score += 25
             reasons.append(f"1H resistance zone ~{near_resistance:.4f}")
 
-    # --- RSI (20 pts) with hard contradiction block ---
+    # --- RSI (20 pts) with contradiction block ---
     max_score += 20
     rsi = last.get("rsi")
     if rsi is not None:
         if allowed_direction == "long":
-            if rsi >= 75:
-                # Overbought on a long — block signal
+            if rsi >= 78:
                 return 0, []
-            if rsi <= 40:
+            if rsi <= 45:
                 score += 20
                 reasons.append(f"RSI oversold ({rsi:.1f})")
         elif allowed_direction == "short":
-            if rsi <= 25:
-                # Oversold on a short — block signal
+            if rsi <= 22:
                 return 0, []
-            if rsi >= 60:
+            if rsi >= 55:
                 score += 20
                 reasons.append(f"RSI overbought ({rsi:.1f})")
 
@@ -220,6 +274,9 @@ def _score_15m(
         score += 10
         reasons.append("Volume spike confirms move")
 
+    if not reasons:
+        return 0, []
+
     return round(score / max_score * 100, 1), reasons
 
 
@@ -237,20 +294,19 @@ def build_signal(
     if len(df_1h) < 50 or len(df_15m) < 50:
         return None
 
-    # Step 1 — determine allowed direction from 1H trend
+    # Step 1 — 1H trend
     trend_1h = _get_1h_trend(df_1h)
     if trend_1h == "uptrend":
         directions_to_try = ["long"]
     elif trend_1h == "downtrend":
         directions_to_try = ["short"]
     else:
-        # Sideways — try both, pick the stronger one
         directions_to_try = ["long", "short"]
 
-    # Step 2 — get 1H S/R levels for confluence
+    # Step 2 — 1H S/R levels
     support_1h, resistance_1h = _get_1h_levels(df_1h)
 
-    # Step 3 — prepare 15m indicators
+    # Step 3 — 15m indicators
     df_15m_ind = add_indicators(df_15m)
 
     best_sig = None
@@ -265,11 +321,10 @@ def build_signal(
         if confidence == 0 or not reasons:
             continue
 
-        # Only keep the best direction
         if confidence <= best_confidence:
             continue
 
-        # Step 5 — duplicate check (persistent across restarts)
+        # Step 5 — duplicate check
         if _is_duplicate(symbol, direction, cooldown_minutes):
             continue
 
@@ -298,7 +353,6 @@ def build_signal(
         tp2_pct = round(abs(take_profit2 - entry) / entry * 100, 3)
         tp3_pct = round(abs(take_profit3 - entry) / entry * 100, 3)
 
-        # Add 1H trend reason at top if not sideways
         if trend_1h != "sideways":
             reasons.insert(0, f"1H {trend_1h} confirmed")
 
