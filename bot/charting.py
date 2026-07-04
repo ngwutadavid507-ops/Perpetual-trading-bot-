@@ -1,5 +1,6 @@
 """
 Generates candlestick chart images for signals.
+Shows Entry, SL, TP1, TP2, TP3 levels with MA lines and RSI panel.
 Uses matplotlib non-interactive backend for server compatibility.
 """
 
@@ -34,6 +35,7 @@ def generate_chart(df: pd.DataFrame, signal) -> io.BytesIO | None:
         n = len(chart_df)
         add_plots = []
 
+        # MA lines
         if "ma_fast" in df.columns:
             add_plots.append(mpf.make_addplot(
                 df["ma_fast"].tail(100).values,
@@ -52,6 +54,7 @@ def generate_chart(df: pd.DataFrame, signal) -> io.BytesIO | None:
                 color="#FF69B4", width=1.2
             ))
 
+        # RSI panel
         if "rsi" in df.columns:
             rsi_values = df["rsi"].tail(100).values
             add_plots.append(mpf.make_addplot(
@@ -63,6 +66,7 @@ def generate_chart(df: pd.DataFrame, signal) -> io.BytesIO | None:
                 y_on_right=False
             ))
 
+        # Entry, SL, TP1, TP2, TP3 horizontal lines
         add_plots += [
             mpf.make_addplot(
                 [signal.entry] * n,
@@ -84,6 +88,12 @@ def generate_chart(df: pd.DataFrame, signal) -> io.BytesIO | None:
             ),
             mpf.make_addplot(
                 [signal.take_profit2] * n,
+                color="#00CC00",
+                width=1.2,
+                linestyle="dashed"
+            ),
+            mpf.make_addplot(
+                [signal.take_profit3] * n,
                 color="#00FF00",
                 width=1.5,
                 linestyle="solid"
@@ -135,26 +145,30 @@ def generate_chart(df: pd.DataFrame, signal) -> io.BytesIO | None:
         chart_buf.seek(0)
 
         # Render legend strip
-        fig, ax = plt.subplots(figsize=(12, 0.5))
+        fig, ax = plt.subplots(figsize=(12, 0.6))
         fig.patch.set_facecolor("#0d1117")
         ax.set_facecolor("#0d1117")
         ax.axis("off")
+
         legend_elements = [
             mpatches.Patch(color="white", label=f"Entry: {signal.entry}"),
             mpatches.Patch(color="#90EE90", label=f"TP1: {signal.take_profit1}"),
-            mpatches.Patch(color="#00FF00", label=f"TP2: {signal.take_profit2}"),
+            mpatches.Patch(color="#00CC00", label=f"TP2: {signal.take_profit2}"),
+            mpatches.Patch(color="#00FF00", label=f"TP3: {signal.take_profit3}"),
             mpatches.Patch(color="#FF4444", label=f"SL: {signal.stop_loss}"),
         ]
+
         ax.legend(
             handles=legend_elements,
             loc="center",
-            ncol=4,
+            ncol=5,
             facecolor="#0d1117",
             labelcolor="white",
             fontsize=10,
             framealpha=0.9,
             edgecolor="#30363d",
         )
+
         legend_buf = io.BytesIO()
         fig.savefig(
             legend_buf,
@@ -165,7 +179,7 @@ def generate_chart(df: pd.DataFrame, signal) -> io.BytesIO | None:
         plt.close("all")
         legend_buf.seek(0)
 
-        # Combine chart and legend
+        # Combine chart and legend into one image
         chart_img = Image.open(chart_buf).convert("RGB")
         legend_img = Image.open(legend_buf).convert("RGB")
 
