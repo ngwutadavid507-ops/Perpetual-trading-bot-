@@ -4,6 +4,8 @@ import pandas as pd
 
 from bot.patterns import detect_engulfing, detect_pin_bar
 from bot.indicators import add_indicators, find_support_resistance, nearest_level
+import logging
+logger = logging.getLogger(__name__)
 
 _seen_signals: dict[str, datetime] = {}
 
