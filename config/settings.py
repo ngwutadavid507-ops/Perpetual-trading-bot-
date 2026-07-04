@@ -15,15 +15,13 @@ class Config:
     MIN_24H_VOLUME_USDT = float(os.getenv("MIN_24H_VOLUME_USDT", "3000000"))
 
     MIN_CONFIDENCE_DEFAULT = float(os.getenv("MIN_CONFIDENCE_DEFAULT", "60"))
-    MIN_CONFIDENCE_BTC = float(os.getenv("MIN_CONFIDENCE_BTC", "70"))
+    MIN_CONFIDENCE_BTC = float(os.getenv("MIN_CONFIDENCE_DEFAULT", "60"))
 
     SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "600"))
 
     MIN_RISK_REWARD = float(os.getenv("MIN_RISK_REWARD", "1.5"))
 
-    SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "30"))
-
-    STRICT_SYMBOLS = {"BTC/USDT:USDT", "BTC/USDT"}
+    SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "60"))
 
     @classmethod
     def validate(cls):
