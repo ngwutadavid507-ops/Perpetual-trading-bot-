@@ -1,6 +1,6 @@
 """
 Fetches the top N cryptocurrencies by market cap from CoinGecko.
-Falls back to a hardcoded top 100 list if CoinGecko is unavailable.
+Falls back to a hardcoded top 300 list if CoinGecko is unavailable.
 Cache persists for 4 hours to avoid rate limits.
 """
 
@@ -13,9 +13,8 @@ logger = logging.getLogger(__name__)
 _cache: tuple[float, set[str]] | None = None
 CACHE_TTL_SECONDS = 4 * 60 * 60
 
-# Hardcoded fallback — top 100 tokens by market cap
-# Used when CoinGecko API is unavailable
 FALLBACK_TOP_SYMBOLS = {
+    # Top 100
     "BTC", "ETH", "USDT", "BNB", "SOL", "XRP", "USDC", "DOGE", "ADA",
     "TRX", "AVAX", "SHIB", "TON", "LINK", "DOT", "BCH", "NEAR", "LTC",
     "UNI", "ICP", "DAI", "APT", "ATOM", "POL", "ETC", "XLM", "OP",
@@ -25,9 +24,38 @@ FALLBACK_TOP_SYMBOLS = {
     "COMP", "YFI", "SNX", "1INCH", "RUNE", "LDO", "CAKE", "DYDX", "ENJ",
     "BAT", "ZRX", "OCEAN", "BAND", "KNC", "REN", "NMR", "SUSHI", "UMA",
     "CELO", "SKL", "STORJ", "ANKR", "CTSI", "OGN", "PERP", "RARI", "SLP",
-    "JASMY", "GALA", "ENS", "APE", "GMT", "LUNC", "LUNA", "HNT", "ROSE",
-    "ONE", "ZIL", "IOTA", "XEM", "HOT", "SC", "BTT", "WIN", "FLOKI",
-    "PEPE", "WIF", "BONK", "JTO", "PYTH", "JUP", "STRK", "TIA", "HYPE",
+    "JASMY", "GALA", "ENS", "APE", "GMT", "LUNC", "HNT", "ROSE", "ONE",
+    "ZIL", "IOTA", "HOT", "SC", "BTT", "WIN", "FLOKI", "PEPE", "WIF",
+    # Top 200
+    "BONK", "JTO", "PYTH", "JUP", "STRK", "TIA", "HYPE", "WLD",
+    "PENDLE", "BLUR", "CFX", "MANTA", "ALT", "PIXEL", "PORTAL",
+    "ETHENA", "ENA", "OMNI", "REZ", "SAGA", "TAIKO", "ZK", "LISTA",
+    "IO", "ZRO", "BANANA", "DOGS", "HMSTR", "CATI", "MAJOR", "NEIRO",
+    "GOAT", "MOODENG", "PNUT", "ACT", "GRASS", "BOME", "SLERF",
+    "POPCAT", "MEW", "BRETT", "TURBO", "MOG", "PONKE", "GIGA",
+    "FWOG", "MICHI", "KEYCAT", "SUNDOG", "LAUNCHCOIN", "VINE",
+    "FARTCOIN", "ZEREBRO", "VIRTUAL", "AIXBT", "MORPHO", "USUAL",
+    "RESOLV", "DEEP", "WAL", "ANIME", "FORM", "IP", "PARTI",
+    "TST", "KAITO", "SHELL", "MOVE", "COOKIE", "SKYAI", "GRIFFAIN",
+    # Top 300
+    "OM", "RENDER", "FET", "AGIX", "OCEAN", "RNDR", "AKT", "NMR",
+    "GNO", "RPL", "LPT", "API3", "BAND", "TRB", "UMA", "DIA",
+    "VELO", "HOOK", "LOKA", "CHESS", "UNFI", "BIFI", "DUSK",
+    "QUICK", "NULS", "MTL", "POLS", "POND", "HARD", "STMX",
+    "WAN", "FIO", "COS", "ARPA", "CTXC", "COCOS", "FOR", "AKRO",
+    "BEL", "WING", "SWAP", "SFP", "BURGER", "MDT", "PROM", "FRONT",
+    "SUSD", "MBL", "FIRO", "SYS", "VIB", "TCT", "VITE", "TROY",
+    "PERL", "OAX", "IDEX", "DOCK", "PHB", "BTS", "KEY", "AION",
+    "STORM", "PPT", "MITH", "EVX", "QSP", "FUEL", "CDT", "DNT",
+    "AMB", "ARN", "SNGLS", "CHAT", "AST", "LEND", "YOYO", "SNM",
+    "VEN", "MOD", "IOST", "SKY", "LOOM", "DENT", "RCN", "APPC",
+    "OST", "INS", "QLC", "STRAT", "BCPT", "POWR", "MCO", "GTO",
+    "GVT", "TNT", "BRD", "ICX", "WTC", "FUN", "POA", "REQ",
+    "XVGC", "XVS", "ALPHA", "AUTO", "BAKE", "BELT", "BUNNY",
+    "EPS", "RABBIT", "TWT", "XNO", "EGLD", "HBAR", "KAVA", "LUNA",
+    "MINA", "SCRT", "MOVR", "ACA", "KSM", "ASTR", "SDN", "PHA",
+    "TEER", "LIT", "GLMR", "PARA", "CSM", "KAR", "BNC", "AUSD",
+    "VDOT", "VSKSM", "KBTC", "KINT", "AIR", "HKO", "CRAB", "AMAS",
 }
 
 
