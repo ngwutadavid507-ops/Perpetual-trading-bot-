@@ -1,17 +1,12 @@
 """
 Multi-timeframe signal engine with 3 TP levels.
-- 1h candles: trend direction and validated S/R zones
+- 1h candles: trend direction and S/R zones
 - 15m candles: entry timing, pattern confirmation
 - TP1 = 3x risk, TP2 = 5x risk, TP3 = 7x risk
 - SL placed beyond the invalidation swing point
-- BTC treated same as all other tokens
-- S/R levels require minimum 2 touches to qualify
-- Candle must be significant relative to recent ATR
-- Signal must form after an impulse move not in chop
+- Redis-backed duplicate cache survives Railway restarts
 """
 
-import os
-import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -20,43 +15,20 @@ import numpy as np
 
 from bot.patterns import detect_engulfing, detect_pin_bar
 from bot.indicators import add_indicators, find_support_resistance, nearest_level
+from bot.redis_client import redis_get, redis_set
 
 logger = logging.getLogger(__name__)
 
-CACHE_FILE = "/tmp/seen_signals.json"
-
-
-def _load_cache() -> dict[str, str]:
-    try:
-        if os.path.exists(CACHE_FILE):
-            with open(CACHE_FILE, "r") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {}
-
-
-def _save_cache(cache: dict[str, str]):
-    try:
-        with open(CACHE_FILE, "w") as f:
-            json.dump(cache, f)
-    except Exception:
-        pass
+COOLDOWN_KEY_PREFIX = "cooldown:"
 
 
 def _is_duplicate(symbol: str, direction: str, cooldown_minutes: int) -> bool:
-    cache = _load_cache()
-    key = f"{symbol}_{direction}"
-    last_str = cache.get(key)
-    if last_str:
-        try:
-            last = datetime.fromisoformat(last_str)
-            if datetime.utcnow() - last < timedelta(minutes=cooldown_minutes):
-                return True
-        except Exception:
-            pass
-    cache[key] = datetime.utcnow().isoformat()
-    _save_cache(cache)
+    key = f"{COOLDOWN_KEY_PREFIX}{symbol}_{direction}"
+    existing = redis_get(key)
+    if existing:
+        return True
+    # Set with expiry equal to cooldown period
+    redis_set(key, "1", ex=cooldown_minutes * 60)
     return False
 
 
@@ -100,10 +72,6 @@ def _calculate_leverage(confidence: float, volatility: str) -> int:
 
 
 def _get_1h_trend(df_1h: pd.DataFrame) -> str:
-    """
-    Determines trend from 1h candles.
-    Returns 'uptrend', 'downtrend', or 'sideways'.
-    """
     df = add_indicators(df_1h)
     last = df.iloc[-1]
     price = last["close"]
@@ -119,67 +87,40 @@ def _get_1h_trend(df_1h: pd.DataFrame) -> str:
 
 
 def _get_1h_levels(df_1h: pd.DataFrame) -> tuple[list, list]:
-    """
-    Gets validated S/R levels from 1h candles.
-    Only levels touched at least twice qualify.
-    """
     df = add_indicators(df_1h)
-    support, resistance = find_support_resistance(df, lookback=80)
-    return support, resistance
+    return find_support_resistance(df, lookback=80)
+
+
+def _calculate_sl(df_15m: pd.DataFrame, direction: str) -> float:
+    if direction == "long":
+        return round(df_15m["low"].tail(10).min() * 0.998, 6)
+    else:
+        return round(df_15m["high"].tail(10).max() * 1.002, 6)
 
 
 def _is_after_impulse(df_15m: pd.DataFrame, direction: str) -> bool:
-    """
-    Checks if price has made a meaningful move before the signal candle.
-    Prevents signals forming in the middle of choppy sideways price action.
-    Looks at the last 5 candles before signal — if they moved at least
-    0.5x ATR in the signal direction, it qualifies as an impulse.
-    Kept loose so it doesn't block too many signals.
-    """
     if "atr" not in df_15m.columns:
         return True
-
     atr = df_15m["atr"].iloc[-1]
     if pd.isna(atr) or atr == 0:
         return True
-
     recent = df_15m.tail(6).iloc[:-1]
     if direction == "short":
         move = recent["close"].iloc[0] - recent["close"].iloc[-1]
     else:
         move = recent["close"].iloc[-1] - recent["close"].iloc[0]
-
     return move >= atr * 0.5
 
 
 def _candle_is_significant(df_15m: pd.DataFrame) -> bool:
-    """
-    Signal candle body must be at least 20% of recent ATR.
-    Filters out tiny doji-like candles that are just noise.
-    Kept loose at 20% to avoid blocking too many signals.
-    """
     if "atr" not in df_15m.columns:
         return True
-
     last = df_15m.iloc[-1]
     atr = df_15m["atr"].iloc[-1]
     if pd.isna(atr) or atr == 0:
         return True
-
     body = abs(last["close"] - last["open"])
     return body >= atr * 0.2
-
-
-def _calculate_sl(df_15m: pd.DataFrame, direction: str) -> float:
-    """
-    Places SL just beyond the recent swing point.
-    Long: below the lowest low of last 10 candles.
-    Short: above the highest high of last 10 candles.
-    """
-    if direction == "long":
-        return round(df_15m["low"].tail(10).min() * 0.998, 6)
-    else:
-        return round(df_15m["high"].tail(10).max() * 1.002, 6)
 
 
 def _score_15m(
@@ -188,10 +129,6 @@ def _score_15m(
     support_1h: list,
     resistance_1h: list,
 ) -> tuple[float, list[str]]:
-    """
-    Scores the 15m setup in the allowed direction.
-    Returns (confidence_0_to_100, reasons).
-    """
     df = add_indicators(df_15m)
     last = df.iloc[-1]
     price = last["close"]
@@ -199,7 +136,6 @@ def _score_15m(
     max_score = 0
     reasons = []
 
-    # --- Candle significance check ---
     if not _candle_is_significant(df):
         return 0, []
 
@@ -219,7 +155,6 @@ def _score_15m(
     else:
         return 0, []
 
-    # --- Impulse move check ---
     if not _is_after_impulse(df, allowed_direction):
         return 0, []
 
@@ -238,7 +173,7 @@ def _score_15m(
             score += 25
             reasons.append(f"1H resistance zone ~{near_resistance:.4f}")
 
-    # --- RSI (20 pts) with contradiction block ---
+    # --- RSI (20 pts) ---
     max_score += 20
     rsi = last.get("rsi")
     if rsi is not None:
@@ -294,7 +229,6 @@ def build_signal(
     if len(df_1h) < 50 or len(df_15m) < 50:
         return None
 
-    # Step 1 — 1H trend
     trend_1h = _get_1h_trend(df_1h)
     if trend_1h == "uptrend":
         directions_to_try = ["long"]
@@ -303,18 +237,12 @@ def build_signal(
     else:
         directions_to_try = ["long", "short"]
 
-    # Step 2 — 1H S/R levels
     support_1h, resistance_1h = _get_1h_levels(df_1h)
-
-    # Step 3 — 15m indicators
     df_15m_ind = add_indicators(df_15m)
-
     best_sig = None
     best_confidence = 0
 
     for direction in directions_to_try:
-
-        # Step 4 — score 15m setup
         confidence, reasons = _score_15m(
             df_15m, direction, support_1h, resistance_1h
         )
@@ -324,19 +252,15 @@ def build_signal(
         if confidence <= best_confidence:
             continue
 
-        # Step 5 — duplicate check
         if _is_duplicate(symbol, direction, cooldown_minutes):
             continue
 
-        # Step 6 — entry and SL
         price = df_15m_ind["close"].iloc[-1]
         stop_loss = _calculate_sl(df_15m_ind, direction)
-
         risk = abs(price - stop_loss)
         if risk == 0:
             continue
 
-        # Step 7 — TP at 3x, 5x, 7x risk
         if direction == "long":
             entry = price
             take_profit1 = round(entry + (risk * 3), 6)
