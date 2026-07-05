@@ -1,9 +1,7 @@
 """
-Fetches the top N cryptocurrencies by market cap from CoinGecko's
-free API (no API key required). Used to filter exchange symbols so
-the bot only scans high quality, liquid, well-known tokens.
-The list refreshes every 4 hours to stay current without hammering
-the free tier rate limits.
+Fetches the top N cryptocurrencies by market cap from CoinGecko.
+Falls back to a hardcoded top 100 list if CoinGecko is unavailable.
+Cache persists for 4 hours to avoid rate limits.
 """
 
 import logging
@@ -14,6 +12,23 @@ logger = logging.getLogger(__name__)
 
 _cache: tuple[float, set[str]] | None = None
 CACHE_TTL_SECONDS = 4 * 60 * 60
+
+# Hardcoded fallback — top 100 tokens by market cap
+# Used when CoinGecko API is unavailable
+FALLBACK_TOP_SYMBOLS = {
+    "BTC", "ETH", "USDT", "BNB", "SOL", "XRP", "USDC", "DOGE", "ADA",
+    "TRX", "AVAX", "SHIB", "TON", "LINK", "DOT", "BCH", "NEAR", "LTC",
+    "UNI", "ICP", "DAI", "APT", "ATOM", "POL", "ETC", "XLM", "OP",
+    "HBAR", "FIL", "ARB", "VET", "MKR", "IMX", "AAVE", "ALGO", "STX",
+    "TAO", "SUI", "RENDER", "INJ", "GRT", "FTM", "SAND", "MANA", "AXS",
+    "THETA", "XTZ", "EGLD", "FLOW", "KAVA", "NEO", "CHZ", "CRV", "ZEC",
+    "COMP", "YFI", "SNX", "1INCH", "RUNE", "LDO", "CAKE", "DYDX", "ENJ",
+    "BAT", "ZRX", "OCEAN", "BAND", "KNC", "REN", "NMR", "SUSHI", "UMA",
+    "CELO", "SKL", "STORJ", "ANKR", "CTSI", "OGN", "PERP", "RARI", "SLP",
+    "JASMY", "GALA", "ENS", "APE", "GMT", "LUNC", "LUNA", "HNT", "ROSE",
+    "ONE", "ZIL", "IOTA", "XEM", "HOT", "SC", "BTT", "WIN", "FLOKI",
+    "PEPE", "WIF", "BONK", "JTO", "PYTH", "JUP", "STRK", "TIA", "HYPE",
+}
 
 
 def get_top_symbols(limit: int = 200) -> set[str]:
@@ -29,10 +44,10 @@ def get_top_symbols(limit: int = 200) -> set[str]:
 
     if not symbols:
         if _cache is not None:
-            logger.warning("[toplist] fetch failed, using stale cache")
+            logger.warning("[toplist] fetch failed — using stale cache")
             return _cache[1]
-        logger.error("[toplist] fetch failed and no cache available")
-        return set()
+        logger.warning("[toplist] fetch failed — using hardcoded fallback list")
+        return FALLBACK_TOP_SYMBOLS
 
     _cache = (time.time(), symbols)
     logger.info(f"[toplist] refreshed — {len(symbols)} top symbols loaded")
