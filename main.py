@@ -6,11 +6,13 @@ Main scanner with:
 - AI filter selects best 1-2 signals per cycle
 - Daily limit: max 15 signals per day
 - Active trade protection per symbol
+- Daily summary sent at midnight UTC
 """
 
 import asyncio
 import logging
 from collections import defaultdict
+from datetime import datetime, timezone
 
 from config.settings import Config
 from bot.exchanges import build_exchange, get_liquid_perp_symbols, fetch_dual_timeframe
@@ -18,6 +20,7 @@ from bot.signal_engine import build_signal, Signal
 from bot.notifier import send_signal
 from bot.tracker import SignalTracker
 from bot.ai_filter import ai_select_signals, get_daily_count, remaining_today, MAX_SIGNALS_PER_DAY
+from bot.summary import record_signal_sent, record_result, format_daily_summary
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,6 +30,7 @@ logger = logging.getLogger("scanner")
 
 tracker = SignalTracker()
 _exchange_cache: dict = {}
+_last_summary_date: str = ""
 
 
 def required_confidence(symbol: str) -> float:
@@ -37,8 +41,7 @@ def get_current_price(symbol: str, exchange: str) -> float | None:
     try:
         ex = _exchange_cache.get(exchange)
         if not ex:
-            # Try any available exchange
-            for ex_id, ex_obj in _exchange_cache.items():
+            for ex_obj in _exchange_cache.values():
                 try:
                     ticker = ex_obj.fetch_ticker(symbol)
                     price = ticker.get("last")
@@ -56,6 +59,35 @@ def get_current_price(symbol: str, exchange: str) -> float | None:
 
 def get_base_symbol(symbol: str) -> str:
     return symbol.split("/")[0]
+
+
+async def send_daily_summary():
+    """Sends the daily performance summary to Telegram."""
+    from telegram import Bot
+    from telegram.constants import ParseMode
+    bot = Bot(token=Config.TELEGRAM_BOT_TOKEN)
+    try:
+        text = format_daily_summary()
+        await bot.send_message(
+            chat_id=Config.TELEGRAM_CHAT_ID,
+            text=text,
+            parse_mode=ParseMode.MARKDOWN
+        )
+        logger.info("Daily summary sent")
+    except Exception as e:
+        logger.error(f"Failed to send daily summary: {e}")
+
+
+async def check_and_send_summary():
+    """Sends summary at midnight UTC once per day."""
+    global _last_summary_date
+    now = datetime.now(timezone.utc)
+    today = str(now.date())
+
+    # Send at midnight — between 00:00 and 00:10 UTC
+    if now.hour == 0 and now.minute < 10 and _last_summary_date != today:
+        _last_summary_date = today
+        await send_daily_summary()
 
 
 async def scan_all_exchanges():
@@ -115,7 +147,7 @@ async def scan_all_exchanges():
 
     for base, ex_sigs in exchange_signals.items():
 
-        # Check direction agreement among exchanges that detected a signal
+        # Check direction agreement
         directions = [sig.direction for sig, _ in ex_sigs.values()]
         if len(set(directions)) > 1:
             logger.debug(f"{base}: exchanges disagree on direction — skipped")
@@ -138,20 +170,19 @@ async def scan_all_exchanges():
                 f"confidence boosted to {best_sig.confidence}%"
             )
         elif best_sig.confidence >= 75:
-            # Single exchange but high confidence — accept
+            # Single exchange high confidence — accept
             best_sig.exchange = "confirmed"
             logger.info(
                 f"{base}: single exchange conf={best_sig.confidence} — accepted"
             )
         else:
-            # Single exchange low confidence — skip
             logger.debug(
                 f"{base}: single exchange conf={best_sig.confidence} "
                 f"< 75 — skipped"
             )
             continue
 
-        # Check if symbol has an active trade
+        # Check active trade on this symbol
         full_symbol = best_sig.symbol
         if tracker.is_symbol_active(full_symbol):
             active = tracker.get_active_trade(full_symbol)
@@ -165,7 +196,7 @@ async def scan_all_exchanges():
                     )
                 else:
                     logger.info(
-                        f"{base}: opposing signal conf={best_sig.confidence} "
+                        f"{base}: opposing conf={best_sig.confidence} "
                         f"too low for reversal — ignored"
                     )
             else:
@@ -180,7 +211,7 @@ async def scan_all_exchanges():
         f"Daily: {get_daily_count()}/{MAX_SIGNALS_PER_DAY}"
     )
 
-    # Send reversal alerts first — urgent
+    # Send reversal alerts first
     for sig, df_15m in reversal_signals:
         active_tracked = tracker.get_active_trade(sig.symbol)
         if active_tracked:
@@ -192,7 +223,7 @@ async def scan_all_exchanges():
             if was_sent:
                 await asyncio.sleep(4)
 
-    # AI filter selects best confirmed signals
+    # AI filter selects best signals
     if confirmed_signals:
         selected = ai_select_signals(confirmed_signals)
         for sig, df_15m in selected:
@@ -203,6 +234,7 @@ async def scan_all_exchanges():
                 df=df_15m,
             )
             tracker.add(sig)
+            record_signal_sent(sig.symbol, sig.direction, sig.confidence)
             logger.info(
                 f"SIGNAL SENT: {sig.symbol} {sig.direction} "
                 f"conf={sig.confidence} | "
@@ -213,6 +245,7 @@ async def scan_all_exchanges():
 
 async def run_once():
     Config.validate()
+    await check_and_send_summary()
     await scan_all_exchanges()
     await tracker.check_all(
         get_current_price,
