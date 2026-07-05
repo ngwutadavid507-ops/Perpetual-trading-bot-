@@ -1,7 +1,6 @@
 """
-Generates TradingView-style candlestick chart images for signals.
-Clean dark theme with proper green/red candles, visible MA lines,
-natural volume bars, and clean level labels on the right.
+Hyperliquid-style candlestick chart.
+Wide rectangular format, tight price zoom, visible MAs.
 """
 
 import io
@@ -13,7 +12,6 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import matplotlib.gridspec as gridspec
 from matplotlib.patches import Rectangle
 from matplotlib.lines import Line2D
@@ -27,20 +25,21 @@ def generate_chart(df: pd.DataFrame, signal) -> io.BytesIO | None:
 
         symbol_clean = signal.symbol.replace(":USDT", "").replace("/USDT", "")
         direction_label = "LONG" if signal.direction == "long" else "SHORT"
-        title = (
-            f"{symbol_clean} | 15m | {direction_label} | "
-            f"{signal.confidence}% Confidence | {signal.leverage}x Leverage"
-        )
+        dir_color = "#26a69a" if signal.direction == "long" else "#ef5350"
 
-        # TradingView-style colors
-        bg = "#131722"
-        up = "#26a69a"
-        down = "#ef5350"
-        grid = "#1e222d"
-        text = "#d1d4dc"
-        border = "#2a2e39"
+        # Hyperliquid color palette
+        bg = "#0d0f14"
+        panel_bg = "#0d0f14"
+        up = "#00c076"
+        down = "#ff3b69"
+        grid = "#1a1d27"
+        text = "#9ba3ae"
+        border = "#1e2130"
+        vol_up = "#00c07650"
+        vol_down = "#ff3b6950"
 
-        fig = plt.figure(figsize=(16, 9), facecolor=bg)
+        # Wide rectangular figure — 16:7
+        fig = plt.figure(figsize=(18, 7), facecolor=bg)
         gs = gridspec.GridSpec(
             2, 1,
             height_ratios=[5, 1],
@@ -52,128 +51,158 @@ def generate_chart(df: pd.DataFrame, signal) -> io.BytesIO | None:
         ax_vol = fig.add_subplot(gs[1], sharex=ax)
 
         for a in [ax, ax_vol]:
-            a.set_facecolor(bg)
-            a.grid(True, color=grid, linewidth=0.4, alpha=1.0, zorder=0)
+            a.set_facecolor(panel_bg)
+            a.grid(True, color=grid, linewidth=0.3, alpha=1.0, zorder=0)
             for spine in a.spines.values():
                 spine.set_edgecolor(border)
-                spine.set_linewidth(0.5)
+                spine.set_linewidth(0.4)
 
-        # Draw candles
-        candle_width = 0.6
+        # Draw candles — wider bodies
+        cw = 0.65
         for i, row in plot_df.iterrows():
-            o = row["open"]
-            h = row["high"]
-            l = row["low"]
-            c = row["close"]
+            o, h, l, c = row["open"], row["high"], row["low"], row["close"]
             color = up if c >= o else down
 
             # Wick
-            ax.plot(
-                [i, i], [l, h],
-                color=color,
-                linewidth=0.7,
-                zorder=2,
-                solid_capstyle="round"
-            )
+            ax.plot([i, i], [l, h], color=color, linewidth=0.6, zorder=2)
 
-            # Body
+            # Body — minimum visible height
             body_y = min(o, c)
-            body_h = max(abs(c - o), (h - l) * 0.008)
+            body_h = max(abs(c - o), (h - l) * 0.015)
             rect = Rectangle(
-                (i - candle_width / 2, body_y),
-                candle_width,
-                body_h,
-                facecolor=color,
-                edgecolor=color,
-                linewidth=0,
-                zorder=3
+                (i - cw / 2, body_y), cw, body_h,
+                facecolor=color, edgecolor=color,
+                linewidth=0, zorder=3
             )
             ax.add_patch(rect)
 
-        # Volume bars
+        # Volume
         for i, row in plot_df.iterrows():
-            color = up if row["close"] >= row["open"] else down
-            ax_vol.bar(
-                i,
-                row["volume"],
-                color=color,
-                alpha=0.6,
-                width=candle_width,
-                zorder=2
-            )
+            color = vol_up if row["close"] >= row["open"] else vol_down
+            ax_vol.bar(i, row["volume"], color=color, width=cw, zorder=2)
 
-        # MA lines
+        # MA lines — only draw if not all NaN
         x = list(range(len(plot_df)))
         ma_lines = []
-        if "ma_fast" in plot_df.columns and not plot_df["ma_fast"].isna().all():
-            ax.plot(x, plot_df["ma_fast"].values, color="#FFD700", linewidth=1.0, zorder=4, alpha=0.9)
-            ma_lines.append(Line2D([0], [0], color="#FFD700", linewidth=1.0, label="MA7"))
-        if "ma_mid" in plot_df.columns and not plot_df["ma_mid"].isna().all():
-            ax.plot(x, plot_df["ma_mid"].values, color="#2196F3", linewidth=1.0, zorder=4, alpha=0.9)
-            ma_lines.append(Line2D([0], [0], color="#2196F3", linewidth=1.0, label="MA25"))
-        if "ma_slow" in plot_df.columns and not plot_df["ma_slow"].isna().all():
-            ax.plot(x, plot_df["ma_slow"].values, color="#E040FB", linewidth=1.0, zorder=4, alpha=0.9)
-            ma_lines.append(Line2D([0], [0], color="#E040FB", linewidth=1.0, label="MA50"))
+        ma_configs = [
+            ("ma_fast", "#f0b90b", "MA7"),
+            ("ma_mid", "#2962ff", "MA25"),
+            ("ma_slow", "#e040fb", "MA50"),
+        ]
+        for col, color, label in ma_configs:
+            if col in plot_df.columns:
+                vals = plot_df[col].values
+                if not np.all(np.isnan(vals.astype(float))):
+                    ax.plot(x, vals, color=color, linewidth=1.1, zorder=4, alpha=0.85)
+                    ma_lines.append(Line2D([0], [0], color=color, linewidth=1.1, label=label))
 
-        # Level lines — sorted to avoid label overlap
-        levels = sorted([
-            (signal.stop_loss, "#F44336", "SL", "-"),
-            (signal.entry, "#B0BEC5", "Entry", "--"),
-            (signal.take_profit1, "#66BB6A", "TP1", "--"),
-            (signal.take_profit2, "#43A047", "TP2", "--"),
-            (signal.take_profit3, "#00E676", "TP3", "-"),
-        ], key=lambda x: x[0])
+        # Y-axis zoom — show SL to TP1 range with padding
+        # This keeps chart tight and readable
+        if signal.direction == "long":
+            y_min = signal.stop_loss
+            y_max = signal.take_profit1
+        else:
+            y_min = signal.take_profit1
+            y_max = signal.stop_loss
 
-        price_min = plot_df["low"].min()
-        price_max = plot_df["high"].max()
-        price_range = price_max - price_min
-        label_offset = price_range * 0.008
+        # Also include current candle range
+        candle_min = plot_df["low"].tail(20).min()
+        candle_max = plot_df["high"].tail(20).max()
+        y_min = min(y_min, candle_min)
+        y_max = max(y_max, candle_max)
 
-        used_y = []
-        for price, color, label, ls in levels:
-            ax.axhline(
-                y=price,
-                color=color,
-                linewidth=1.2,
-                linestyle=ls,
-                zorder=5,
-                alpha=0.9
-            )
-            # Adjust label y to avoid overlap
+        padding = (y_max - y_min) * 0.12
+        ax.set_ylim(y_min - padding, y_max + padding)
+        ax.set_xlim(-1, len(plot_df) + 10)
+        ax_vol.set_xlim(-1, len(plot_df) + 10)
+
+        # Level lines with right-side labels
+        levels = [
+            (signal.stop_loss, "#ff3b69", "SL", "-", 1.5),
+            (signal.entry, "#9ba3ae", "Entry", "--", 1.0),
+            (signal.take_profit1, "#00c076", "TP1", "--", 1.2),
+            (signal.take_profit2, "#00e676", "TP2", "--", 1.2),
+            (signal.take_profit3, "#69ff8e", "TP3", "-", 1.5),
+        ]
+
+        ylim = ax.get_ylim()
+        y_range = ylim[1] - ylim[0]
+        min_gap = y_range * 0.025
+        used_ys = []
+
+        for price, color, label, ls, lw in sorted(levels, key=lambda v: v[0]):
+            if price < ylim[0] or price > ylim[1]:
+                continue
+
+            ax.axhline(y=price, color=color, linewidth=lw,
+                      linestyle=ls, zorder=5, alpha=0.85)
+
+            # Avoid label overlap
             label_y = price
-            for used in used_y:
-                if abs(label_y - used) < label_offset * 2:
-                    label_y = used + label_offset * 2.5
-            used_y.append(label_y)
+            for uy in used_ys:
+                if abs(label_y - uy) < min_gap:
+                    label_y = uy + min_gap
+            used_ys.append(label_y)
 
             ax.annotate(
                 f"{label}: {price}",
-                xy=(len(plot_df) - 0.5, label_y),
-                xycoords="data",
+                xy=(len(plot_df) + 0.2, label_y),
+                xycoords=("data", "data"),
                 color=color,
-                fontsize=7.5,
+                fontsize=7.8,
                 fontweight="bold",
                 va="center",
                 ha="left",
                 zorder=6,
                 annotation_clip=False,
+                fontfamily="monospace",
             )
 
-        # Set price axis range with padding
-        padding = price_range * 0.15
-        ax.set_ylim(price_min - padding, price_max + padding)
-        ax.set_xlim(-1, len(plot_df) + 8)
-        ax_vol.set_xlim(-1, len(plot_df) + 8)
+        # Header bar — symbol and direction
+        ax.text(
+            0.01, 0.97,
+            f"{symbol_clean} · 15m",
+            transform=ax.transAxes,
+            color="#ffffff",
+            fontsize=11,
+            fontweight="bold",
+            va="top", ha="left",
+        )
+        ax.text(
+            0.01, 0.88,
+            f"● {direction_label}",
+            transform=ax.transAxes,
+            color=dir_color,
+            fontsize=9,
+            fontweight="bold",
+            va="top", ha="left",
+        )
+        ax.text(
+            0.08, 0.88,
+            f"{signal.confidence}% Confidence · {signal.leverage}x",
+            transform=ax.transAxes,
+            color=text,
+            fontsize=8.5,
+            va="top", ha="left",
+        )
 
-        # Title
-        ax.set_title(title, color=text, fontsize=10, pad=8, fontweight="bold", loc="left")
+        # MA legend top right
+        if ma_lines:
+            ax.legend(
+                handles=ma_lines,
+                loc="upper right",
+                facecolor=bg,
+                labelcolor=text,
+                fontsize=7.5,
+                framealpha=0.7,
+                edgecolor=border,
+                borderpad=0.4,
+            )
 
         # Tick styling
-        ax.tick_params(colors=text, labelsize=7.5, which="both", length=3)
-        ax_vol.tick_params(colors=text, labelsize=7, which="both", length=2)
+        ax.tick_params(colors=text, labelsize=7.5, length=3, width=0.4)
+        ax_vol.tick_params(colors=text, labelsize=7, length=2, width=0.4)
         ax.tick_params(axis="x", labelbottom=False)
-        ax.yaxis.set_tick_params(labelcolor=text)
-        ax_vol.yaxis.set_tick_params(labelcolor=text)
 
         # X-axis timestamps
         timestamps = plot_df["timestamp"].dt.strftime("%m/%d %H:%M")
@@ -182,30 +211,21 @@ def generate_chart(df: pd.DataFrame, signal) -> io.BytesIO | None:
         ax_vol.set_xticks(tick_pos)
         ax_vol.set_xticklabels(
             [timestamps.iloc[i] for i in tick_pos],
-            rotation=0,
-            fontsize=7,
-            color=text
+            rotation=0, fontsize=7, color=text
         )
 
-        # MA legend
-        if ma_lines:
-            legend = ax.legend(
-                handles=ma_lines,
-                loc="upper left",
-                facecolor=bg,
-                labelcolor=text,
-                fontsize=7.5,
-                framealpha=0.8,
-                edgecolor=border,
-            )
-
-        # Volume label
+        # Volume y-label
         ax_vol.set_ylabel("Vol", color=text, fontsize=7, labelpad=2)
+        ax_vol.yaxis.set_major_formatter(
+            matplotlib.ticker.FuncFormatter(
+                lambda x, _: f"{x/1e6:.1f}M" if x >= 1e6 else f"{x/1e3:.0f}K"
+            )
+        )
 
-        plt.subplots_adjust(left=0.06, right=0.82, top=0.95, bottom=0.06)
+        plt.subplots_adjust(left=0.05, right=0.83, top=0.97, bottom=0.07)
 
         buf = io.BytesIO()
-        fig.savefig(buf, dpi=120, bbox_inches="tight", facecolor=bg)
+        fig.savefig(buf, dpi=110, bbox_inches="tight", facecolor=bg)
         plt.close("all")
         buf.seek(0)
         return buf
