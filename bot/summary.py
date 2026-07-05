@@ -1,28 +1,29 @@
 """
-Daily summary generator.
+Daily summary generator — Redis backed, survives Railway restarts.
 Tracks all signal results throughout the day and sends
 a professional summary to the Telegram channel at midnight UTC.
 """
 
 import json
 import logging
-import os
 from datetime import datetime, date
+
+from bot.redis_client import redis_get, redis_set
 
 logger = logging.getLogger(__name__)
 
-SUMMARY_FILE = "/tmp/daily_summary.json"
+
+def _today_key() -> str:
+    return f"summary:{date.today()}"
 
 
 def _load_summary() -> dict:
-    try:
-        if os.path.exists(SUMMARY_FILE):
-            with open(SUMMARY_FILE, "r") as f:
-                data = json.load(f)
-                if data.get("date") == str(date.today()):
-                    return data
-    except Exception:
-        pass
+    raw = redis_get(_today_key())
+    if raw:
+        try:
+            return json.loads(raw)
+        except Exception:
+            pass
     return {
         "date": str(date.today()),
         "signals_sent": 0,
@@ -36,11 +37,7 @@ def _load_summary() -> dict:
 
 
 def _save_summary(data: dict):
-    try:
-        with open(SUMMARY_FILE, "w") as f:
-            json.dump(data, f)
-    except Exception as e:
-        logger.error(f"[summary] save failed: {e}")
+    redis_set(_today_key(), json.dumps(data), ex=48 * 3600)
 
 
 def record_signal_sent(symbol: str, direction: str, confidence: float):
@@ -74,7 +71,6 @@ def record_result(symbol: str, direction: str, result: str, pnl_r: float):
         data["sl_hits"] += 1
         data["total_r"] = round(data["total_r"] + pnl_r, 2)
 
-    # Update the matching open result
     for r in data["results"]:
         if r["symbol"] == symbol_clean and r["result"] == "open":
             r["result"] = result
@@ -101,7 +97,6 @@ def format_daily_summary() -> str:
     win_rate = round(wins / closed * 100) if closed > 0 else 0
     total_r_str = f"+{total_r}R" if total_r >= 0 else f"{total_r}R"
 
-    # Build results list
     results_block = ""
     for r in results:
         direction_emoji = "🟢" if r["direction"] == "long" else "🔴"
@@ -138,4 +133,4 @@ def format_daily_summary() -> str:
         f"Total R: *{total_r_str}*\n\n"
         f"*Results:*\n{results_block}\n"
         f"_Phoenix Signal Bot 🔥_"
-  )
+    )
