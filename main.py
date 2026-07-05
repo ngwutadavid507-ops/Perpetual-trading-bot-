@@ -1,10 +1,11 @@
 """
 Main scanner with:
-- Cross-exchange confirmation: signal only fires when OKX AND BingX agree
-- Reversal alerts: opposing high-confidence signal on active trade
-- AI filter: selects best 1-2 signals per cycle
+- Single exchange signals fire if confidence >= 75%
+- Cross-exchange confirmation boosts confidence by 10%
+- Reversal alerts for opposing signals on active trades
+- AI filter selects best 1-2 signals per cycle
 - Daily limit: max 15 signals per day
-- Active trade protection: no new signal on symbol already in trade
+- Active trade protection per symbol
 """
 
 import asyncio
@@ -36,32 +37,35 @@ def get_current_price(symbol: str, exchange: str) -> float | None:
     try:
         ex = _exchange_cache.get(exchange)
         if not ex:
-            return None
-        ticker = ex.fetch_ticker(symbol)
-        return ticker.get("last")
+            # Try any available exchange
+            for ex_id, ex_obj in _exchange_cache.items():
+                try:
+                    ticker = ex_obj.fetch_ticker(symbol)
+                    price = ticker.get("last")
+                    if price:
+                        return price
+                except Exception:
+                    continue
+        else:
+            ticker = ex.fetch_ticker(symbol)
+            return ticker.get("last")
     except Exception as e:
         logger.debug(f"Price check failed for {symbol}: {e}")
-        return None
+    return None
 
 
 def get_base_symbol(symbol: str) -> str:
-    """Extracts base symbol e.g. ETH from ETH/USDT:USDT"""
     return symbol.split("/")[0]
 
 
 async def scan_all_exchanges():
-    """
-    Scans all exchanges and collects signals per base symbol.
-    Only fires a signal when ALL configured exchanges agree on direction.
-    Handles reversal alerts for active trades.
-    """
     daily_remaining = remaining_today()
     if daily_remaining <= 0:
         logger.info(f"Daily limit reached ({MAX_SIGNALS_PER_DAY}) — skipping scan")
         return
 
-    # Structure: {base_symbol: {exchange_id: (Signal, df_15m)}}
-    exchange_signals: dict[str, dict[str, tuple[Signal, object]]] = defaultdict(dict)
+    # {base_symbol: {exchange_id: (Signal, df_15m)}}
+    exchange_signals: dict[str, dict[str, tuple]] = defaultdict(dict)
 
     for exchange_id in Config.EXCHANGES:
         exchange = build_exchange(exchange_id)
@@ -105,43 +109,53 @@ async def scan_all_exchanges():
 
         logger.info(f"[{exchange_id}] scan complete — {skipped} skipped")
 
-    # Cross-exchange confirmation
-    # Signal only qualifies if ALL exchanges agree on same direction
-    confirmed_signals: list[tuple[Signal, object]] = []
-    reversal_signals: list[tuple[Signal, object]] = []
-
     num_exchanges = len(Config.EXCHANGES)
+    confirmed_signals: list[tuple] = []
+    reversal_signals: list[tuple] = []
 
     for base, ex_sigs in exchange_signals.items():
-        if len(ex_sigs) < num_exchanges:
-            # Not all exchanges detected a signal — skip
-            logger.debug(
-                f"{base}: only {len(ex_sigs)}/{num_exchanges} "
-                f"exchanges agree — skipped"
-            )
-            continue
 
-        # Check all exchanges agree on same direction
+        # Check direction agreement among exchanges that detected a signal
         directions = [sig.direction for sig, _ in ex_sigs.values()]
         if len(set(directions)) > 1:
             logger.debug(f"{base}: exchanges disagree on direction — skipped")
             continue
 
-        # All agree — pick the signal with highest confidence
+        # Pick highest confidence signal
         best_sig, best_df = max(
             ex_sigs.values(),
             key=lambda x: x[0].confidence
         )
 
-        # Remove exchange label from symbol display
-        best_sig.exchange = "confirmed"
+        num_agreeing = len(ex_sigs)
 
-        # Check if this symbol has an active trade
+        if num_agreeing == num_exchanges:
+            # All exchanges agree — boost confidence 10%
+            best_sig.confidence = min(100.0, round(best_sig.confidence * 1.1, 1))
+            best_sig.exchange = "confirmed"
+            logger.info(
+                f"{base}: cross-exchange confirmed — "
+                f"confidence boosted to {best_sig.confidence}%"
+            )
+        elif best_sig.confidence >= 75:
+            # Single exchange but high confidence — accept
+            best_sig.exchange = "confirmed"
+            logger.info(
+                f"{base}: single exchange conf={best_sig.confidence} — accepted"
+            )
+        else:
+            # Single exchange low confidence — skip
+            logger.debug(
+                f"{base}: single exchange conf={best_sig.confidence} "
+                f"< 75 — skipped"
+            )
+            continue
+
+        # Check if symbol has an active trade
         full_symbol = best_sig.symbol
         if tracker.is_symbol_active(full_symbol):
             active = tracker.get_active_trade(full_symbol)
             if active and active.signal.direction != best_sig.direction:
-                # Opposing signal on active trade — check if strong enough for reversal
                 if best_sig.confidence >= 80:
                     reversal_signals.append((best_sig, best_df))
                     logger.info(
@@ -166,7 +180,7 @@ async def scan_all_exchanges():
         f"Daily: {get_daily_count()}/{MAX_SIGNALS_PER_DAY}"
     )
 
-    # Send reversal alerts first — these are urgent
+    # Send reversal alerts first — urgent
     for sig, df_15m in reversal_signals:
         active_tracked = tracker.get_active_trade(sig.symbol)
         if active_tracked:
