@@ -169,7 +169,7 @@ async def scan_all_exchanges():
                 f"{base}: cross-exchange confirmed — "
                 f"confidence boosted to {best_sig.confidence}%"
             )
-        elif best_sig.confidence >= 75:
+        elif best_sig.confidence >= 65:
             # Single exchange high confidence — accept
             best_sig.exchange = "confirmed"
             logger.info(
