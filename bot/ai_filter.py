@@ -1,72 +1,59 @@
 """
 AI-powered signal filter using Claude API.
-After the scanner collects all qualifying signals each cycle,
-this module sends them to Claude which:
-1. Evaluates each signal's quality in context
-2. Selects only the best 1-2 signals per scan
-3. Enforces the daily limit of 15 signals
-4. Returns reasoning for why each signal was selected or rejected
+Daily limit and signal log stored in Redis — persists across restarts.
 """
 
 import json
 import logging
 import os
-from datetime import datetime, date
+from datetime import date
 
-import requests
+import requests as http_requests
+
+from bot.redis_client import redis_get, redis_set, redis_incr, redis_expire
 
 logger = logging.getLogger(__name__)
 
-DAILY_LOG_FILE = "/tmp/daily_signals.json"
 MAX_SIGNALS_PER_DAY = 15
 MAX_SIGNALS_PER_SCAN = 2
 
-
-def _load_daily_log() -> dict:
-    try:
-        if os.path.exists(DAILY_LOG_FILE):
-            with open(DAILY_LOG_FILE, "r") as f:
-                data = json.load(f)
-                if data.get("date") == str(date.today()):
-                    return data
-    except Exception:
-        pass
-    return {"date": str(date.today()), "count": 0, "signals": []}
+DAILY_COUNT_KEY = f"daily_count:{date.today()}"
+DAILY_LOG_KEY = f"daily_log:{date.today()}"
 
 
-def _save_daily_log(log: dict):
-    try:
-        with open(DAILY_LOG_FILE, "w") as f:
-            json.dump(log, f)
-    except Exception:
-        pass
+def _today_count_key() -> str:
+    return f"daily_count:{date.today()}"
+
+
+def _today_log_key() -> str:
+    return f"daily_log:{date.today()}"
 
 
 def get_daily_count() -> int:
-    return _load_daily_log()["count"]
-
-
-def increment_daily_count(signal_summary: str):
-    log = _load_daily_log()
-    log["count"] += 1
-    log["signals"].append({
-        "time": datetime.utcnow().isoformat(),
-        "summary": signal_summary,
-    })
-    _save_daily_log(log)
+    val = redis_get(_today_count_key())
+    return int(val) if val else 0
 
 
 def remaining_today() -> int:
     return max(0, MAX_SIGNALS_PER_DAY - get_daily_count())
 
 
-def ai_select_signals(candidates: list) -> list:
-    """
-    Takes a list of Signal objects, sends them to Claude for evaluation,
-    and returns only the top signals worth sending.
+def increment_daily_count(signal_summary: str):
+    key = _today_count_key()
+    count = redis_incr(key)
+    if count == 1:
+        # First increment — set expiry to 48 hours so it auto-cleans
+        redis_expire(key, 48 * 3600)
 
-    Returns a filtered list of (Signal, df) tuples.
-    """
+    # Append to log
+    log_key = _today_log_key()
+    existing = redis_get(log_key)
+    logs = json.loads(existing) if existing else []
+    logs.append(signal_summary)
+    redis_set(log_key, json.dumps(logs), ex=48 * 3600)
+
+
+def ai_select_signals(candidates: list) -> list:
     if not candidates:
         return []
 
@@ -75,16 +62,15 @@ def ai_select_signals(candidates: list) -> list:
         logger.info(f"[ai_filter] Daily limit reached ({MAX_SIGNALS_PER_DAY})")
         return []
 
-    # Cap at per-scan limit and daily remaining
     max_to_send = min(MAX_SIGNALS_PER_SCAN, daily_remaining)
 
-    # If only one candidate just return it directly — no need for AI
     if len(candidates) <= max_to_send:
         for sig, _ in candidates:
-            increment_daily_count(f"{sig.symbol} {sig.direction} {sig.confidence}%")
+            increment_daily_count(
+                f"{sig.symbol} {sig.direction} {sig.confidence}%"
+            )
         return candidates
 
-    # Build signal descriptions for Claude to evaluate
     signal_descriptions = []
     for i, (sig, _) in enumerate(candidates):
         signal_descriptions.append({
@@ -103,28 +89,26 @@ def ai_select_signals(candidates: list) -> list:
 
     prompt = f"""You are a professional crypto futures trading signal evaluator.
 
-I have {len(candidates)} qualifying signals from a scan. I can only send {max_to_send} signal(s) this cycle. I have {daily_remaining} signals remaining today out of {MAX_SIGNALS_PER_DAY} maximum.
+I have {len(candidates)} qualifying signals. I can only send {max_to_send} signal(s) this cycle. I have {daily_remaining} signals remaining today out of {MAX_SIGNALS_PER_DAY} maximum.
 
-Here are the candidates:
+Candidates:
 {json.dumps(signal_descriptions, indent=2)}
 
-Evaluate each signal and select the best {max_to_send} based on:
+Select the best {max_to_send} based on:
 1. Confidence score (higher is better)
 2. Quality and consistency of reasons (more confluence = better)
 3. Risk/reward profile (tighter SL % with good TP % = better)
-4. Avoid selecting two signals in the same direction if possible
+4. Avoid two signals in the same direction if possible
 5. Prefer signals with more reasons listed
 
-Respond ONLY with a JSON object in this exact format, no other text:
+Respond ONLY with JSON, no other text:
 {{
   "selected": [0, 2],
-  "reasoning": "Brief explanation of why these were chosen over others"
-}}
-
-The "selected" array should contain the index numbers of the signals you choose."""
+  "reasoning": "Brief explanation"
+}}"""
 
     try:
-        response = requests.post(
+        response = http_requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={"Content-Type": "application/json"},
             json={
@@ -143,7 +127,7 @@ The "selected" array should contain the index numbers of the signals you choose.
 
         selected_indices = result.get("selected", [])
         reasoning = result.get("reasoning", "")
-        logger.info(f"[ai_filter] Claude selected indices {selected_indices}: {reasoning}")
+        logger.info(f"[ai_filter] selected {selected_indices}: {reasoning}")
 
         selected = []
         for idx in selected_indices:
@@ -157,8 +141,7 @@ The "selected" array should contain the index numbers of the signals you choose.
         return selected
 
     except Exception as e:
-        logger.error(f"[ai_filter] Claude API call failed: {e}")
-        # Fallback — sort by confidence and return top signals
+        logger.error(f"[ai_filter] Claude API failed: {e}")
         sorted_candidates = sorted(
             candidates,
             key=lambda x: x[0].confidence,
