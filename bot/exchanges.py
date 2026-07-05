@@ -1,7 +1,8 @@
 """
 Unified exchange access using ccxt. Fetches both 1h and 15m candles
 for multi-timeframe signal analysis. Filters out options, futures with
-expiry, and synthetic/forex tokens. Only scans USDT linear perpetual swaps.
+expiry, synthetic/forex tokens, and known junk tokens.
+Only scans USDT linear perpetual swaps in the top symbol list.
 """
 
 import logging
@@ -15,23 +16,30 @@ logger = logging.getLogger(__name__)
 EXCHANGE_CLASS_MAP = {
     "bybit": (ccxt.bybit, {
         "enableRateLimit": True,
-        "options": {
-            "defaultType": "linear",
-        }
+        "options": {"defaultType": "linear"},
     }),
     "okx": (ccxt.okx, {
         "enableRateLimit": True,
         "options": {
             "defaultType": "swap",
             "defaultSubType": "linear",
-        }
+        },
     }),
     "bingx": (ccxt.bingx, {
         "enableRateLimit": True,
-        "options": {
-            "defaultType": "swap",
-        }
+        "options": {"defaultType": "swap"},
     }),
+}
+
+# Tokens to always block regardless of top list
+JUNK_PREFIXES = [
+    "NC", "EUR", "GBP", "SGD", "JPY", "AUD",
+    "USD2", "2USD", "BVOL", "DVOL", "PIE", "WLFI",
+]
+
+JUNK_EXACT = {
+    "PIEVERSE", "WLFI", "EURI", "EURC", "FDUSD",
+    "TUSD", "BUSD", "USDP", "GUSD", "HUSD",
 }
 
 
@@ -51,15 +59,10 @@ def get_liquid_perp_symbols(exchange, min_24h_volume_usdt: float) -> list[str]:
         logger.error(f"[{exchange.id}] failed to load markets: {e}")
         return []
 
-    junk_prefixes = [
-        "NC", "EUR", "GBP", "SGD", "JPY",
-        "AUD", "USD2", "2USD", "BVOL", "DVOL"
-    ]
-
     candidates = []
     for symbol, m in markets.items():
 
-        # Must be a linear USDT-settled perpetual swap
+        # Must be active linear USDT-settled perpetual swap
         if not m.get("swap"):
             continue
         if not m.get("linear"):
@@ -69,27 +72,25 @@ def get_liquid_perp_symbols(exchange, min_24h_volume_usdt: float) -> list[str]:
         if not m.get("active", True):
             continue
 
-        # Block options contracts
+        # Block options and dated contracts
         if m.get("type") == "option":
             continue
-
-        # Block any contract with an expiry date — only true perpetuals
         if m.get("expiry") is not None:
             continue
         if m.get("expiryDatetime") is not None:
             continue
 
-        # Block futures (dated contracts)
-        if m.get("future") and not m.get("swap"):
-            continue
-
         base = m.get("base", "").upper()
 
-        # Block junk/synthetic/forex tokens
-        if any(base.startswith(junk) for junk in junk_prefixes):
+        # Block junk by prefix
+        if any(base.startswith(j) for j in JUNK_PREFIXES):
             continue
 
-        # Only allow top 200 tokens by market cap
+        # Block junk by exact match
+        if base in JUNK_EXACT:
+            continue
+
+        # Only allow top symbols
         if top_symbols and not is_top_symbol(base, top_symbols):
             continue
 
@@ -115,7 +116,7 @@ def get_liquid_perp_symbols(exchange, min_24h_volume_usdt: float) -> list[str]:
             liquid.append(symbol)
 
     logger.info(
-        f"[{exchange.id}] {len(liquid)}/{len(candidates)} top-200 perp symbols "
+        f"[{exchange.id}] {len(liquid)}/{len(candidates)} symbols "
         f"pass the {min_24h_volume_usdt:,.0f} USDT volume floor"
     )
     return liquid
@@ -125,7 +126,7 @@ def fetch_ohlcv_df(
     exchange,
     symbol: str,
     timeframe: str,
-    limit: int = 150
+    limit: int = 150,
 ) -> pd.DataFrame | None:
     try:
         raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -148,10 +149,7 @@ def fetch_dual_timeframe(
     exchange,
     symbol: str,
 ) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
-    """
-    Fetches both 1h and 15m candles for a symbol.
-    Returns (df_1h, df_15m) — either can be None if fetch fails.
-    """
+    """Fetches both 1h and 15m candles for a symbol."""
     df_1h = fetch_ohlcv_df(exchange, symbol, "1h", limit=150)
     df_15m = fetch_ohlcv_df(exchange, symbol, "15m", limit=100)
     return df_1h, df_15m
