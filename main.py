@@ -1,12 +1,12 @@
 import asyncio
 import logging
-from datetime import datetime, date
 
 from config.settings import Config
 from bot.exchanges import build_exchange, get_liquid_perp_symbols, fetch_dual_timeframe
-from bot.signal_engine import build_signal, Signal
+from bot.signal_engine import build_signal
 from bot.notifier import send_signal
 from bot.tracker import SignalTracker
+from bot.ai_filter import ai_select_signals, get_daily_count, remaining_today, MAX_SIGNALS_PER_DAY
 
 logging.basicConfig(
     level=logging.INFO,
@@ -14,36 +14,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("scanner")
 
-STRICT_BASE_CURRENCIES = set()
 tracker = SignalTracker()
 _exchange_cache: dict = {}
 
-# Daily signal counter
-_daily_count: dict[str, int] = {"date": str(date.today()), "count": 0}
-MAX_SIGNALS_PER_DAY = 15
-MAX_SIGNALS_PER_SCAN = 2
-
-
-def _get_daily_count() -> int:
-    today = str(date.today())
-    if _daily_count["date"] != today:
-        _daily_count["date"] = today
-        _daily_count["count"] = 0
-    return _daily_count["count"]
-
-
-def _increment_daily_count():
-    today = str(date.today())
-    if _daily_count["date"] != today:
-        _daily_count["date"] = today
-        _daily_count["count"] = 0
-    _daily_count["count"] += 1
-
 
 def required_confidence(symbol: str) -> float:
-    base = symbol.split("/")[0]
-    if base in STRICT_BASE_CURRENCIES:
-        return Config.MIN_CONFIDENCE_BTC
     return Config.MIN_CONFIDENCE_DEFAULT
 
 
@@ -62,13 +37,18 @@ def get_current_price(symbol: str, exchange_id: str) -> float | None:
 async def scan_all_exchanges():
     """
     Scans all exchanges, collects all qualifying signals,
-    sorts by confidence, and sends only the top MAX_SIGNALS_PER_SCAN.
+    passes them to Claude AI filter which selects the best
+    1-2 per cycle while enforcing the daily limit of 15.
     """
-    if _get_daily_count() >= MAX_SIGNALS_PER_DAY:
-        logger.info(f"Daily signal limit ({MAX_SIGNALS_PER_DAY}) reached — skipping scan")
+    daily_remaining = remaining_today()
+    if daily_remaining <= 0:
+        logger.info(
+            f"Daily signal limit reached "
+            f"({MAX_SIGNALS_PER_DAY}/{MAX_SIGNALS_PER_DAY}) — skipping scan"
+        )
         return
 
-    all_candidates: list[tuple[Signal, object]] = []
+    all_candidates = []
 
     for exchange_id in Config.EXCHANGES:
         exchange = build_exchange(exchange_id)
@@ -81,7 +61,6 @@ async def scan_all_exchanges():
         for symbol in symbols:
             try:
                 df_1h, df_15m = fetch_dual_timeframe(exchange, symbol)
-
                 if df_1h is None or df_15m is None:
                     skipped += 1
                     continue
@@ -116,23 +95,19 @@ async def scan_all_exchanges():
             f"{skipped} symbols skipped (no data)"
         )
 
+    logger.info(
+        f"Total candidates this cycle: {len(all_candidates)} | "
+        f"Daily: {get_daily_count()}/{MAX_SIGNALS_PER_DAY}"
+    )
+
     if not all_candidates:
         logger.info("No qualifying signals this cycle")
         return
 
-    # Sort by confidence descending — best signals first
-    all_candidates.sort(key=lambda x: x[0].confidence, reverse=True)
+    # AI filter selects the best signals and enforces limits
+    selected = ai_select_signals(all_candidates)
 
-    # How many can we still send today
-    remaining_today = MAX_SIGNALS_PER_DAY - _get_daily_count()
-    to_send = all_candidates[:min(MAX_SIGNALS_PER_SCAN, remaining_today)]
-
-    logger.info(
-        f"Sending {len(to_send)} signal(s) this cycle "
-        f"({_get_daily_count()}/{MAX_SIGNALS_PER_DAY} used today)"
-    )
-
-    for sig, df_15m in to_send:
+    for sig, df_15m in selected:
         await send_signal(
             Config.TELEGRAM_BOT_TOKEN,
             Config.TELEGRAM_CHAT_ID,
@@ -140,14 +115,12 @@ async def scan_all_exchanges():
             df=df_15m,
         )
         tracker.add(sig)
-        _increment_daily_count()
         logger.info(
             f"SIGNAL SENT: {sig.symbol} {sig.direction} "
-            f"conf={sig.confidence} "
-            f"({_get_daily_count()}/{MAX_SIGNALS_PER_DAY} today)"
+            f"conf={sig.confidence} | "
+            f"Daily: {get_daily_count()}/{MAX_SIGNALS_PER_DAY}"
         )
-        # Delay between signals to avoid Telegram flood control
-        await asyncio.sleep(5)
+        await asyncio.sleep(4)
 
 
 async def run_once():
