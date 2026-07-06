@@ -1,12 +1,12 @@
 """
-Upstash Redis client using REST API.
-Persistent storage that survives Railway restarts.
-All state — signal cooldown, daily limits, tracker — stored here.
+Upstash Redis client using REST API with POST requests.
+Handles complex JSON values safely.
 """
 
 import logging
 import os
 import requests
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -15,117 +15,99 @@ REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
 
 def _headers() -> dict:
-    return {"Authorization": f"Bearer {REDIS_TOKEN}"}
+    return {
+        "Authorization": f"Bearer {REDIS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+
+def _post(command: list) -> dict:
+    """Execute a Redis command via POST request."""
+    try:
+        r = requests.post(
+            REDIS_URL,
+            headers=_headers(),
+            json=command,
+            timeout=10,
+        )
+        if r.status_code == 200:
+            return r.json()
+        logger.error(f"[redis] HTTP {r.status_code}: {r.text}")
+        return {}
+    except Exception as e:
+        logger.error(f"[redis] request failed: {e}")
+        return {}
 
 
 def redis_set(key: str, value: str, ex: int = None) -> bool:
-    """Set a key with optional expiry in seconds."""
-    try:
-        if ex:
-            url = f"{REDIS_URL}/set/{key}/{value}/ex/{ex}"
-        else:
-            url = f"{REDIS_URL}/set/{key}/{value}"
-        r = requests.get(url, headers=_headers(), timeout=5)
-        return r.status_code == 200
-    except Exception as e:
-        logger.error(f"[redis] set failed for {key}: {e}")
-        return False
+    if ex:
+        result = _post(["SET", key, value, "EX", ex])
+    else:
+        result = _post(["SET", key, value])
+    return result.get("result") == "OK"
 
 
 def redis_get(key: str) -> str | None:
-    """Get a key value or None if not exists."""
-    try:
-        url = f"{REDIS_URL}/get/{key}"
-        r = requests.get(url, headers=_headers(), timeout=5)
-        if r.status_code == 200:
-            data = r.json()
-            return data.get("result")
-        return None
-    except Exception as e:
-        logger.error(f"[redis] get failed for {key}: {e}")
-        return None
+    result = _post(["GET", key])
+    return result.get("result")
 
 
 def redis_delete(key: str) -> bool:
-    """Delete a key."""
-    try:
-        url = f"{REDIS_URL}/del/{key}"
-        r = requests.get(url, headers=_headers(), timeout=5)
-        return r.status_code == 200
-    except Exception as e:
-        logger.error(f"[redis] delete failed for {key}: {e}")
-        return False
+    result = _post(["DEL", key])
+    return bool(result.get("result"))
 
 
 def redis_incr(key: str) -> int | None:
-    """Increment a counter and return new value."""
-    try:
-        url = f"{REDIS_URL}/incr/{key}"
-        r = requests.get(url, headers=_headers(), timeout=5)
-        if r.status_code == 200:
-            return r.json().get("result")
-        return None
-    except Exception as e:
-        logger.error(f"[redis] incr failed for {key}: {e}")
-        return None
+    result = _post(["INCR", key])
+    return result.get("result")
 
 
 def redis_expire(key: str, seconds: int) -> bool:
-    """Set expiry on existing key."""
-    try:
-        url = f"{REDIS_URL}/expire/{key}/{seconds}"
-        r = requests.get(url, headers=_headers(), timeout=5)
-        return r.status_code == 200
-    except Exception as e:
-        logger.error(f"[redis] expire failed for {key}: {e}")
-        return False
+    result = _post(["EXPIRE", key, seconds])
+    return bool(result.get("result"))
 
 
 def redis_hset(key: str, field: str, value: str) -> bool:
-    """Set a hash field."""
-    try:
-        url = f"{REDIS_URL}/hset/{key}/{field}/{value}"
-        r = requests.get(url, headers=_headers(), timeout=5)
-        return r.status_code == 200
-    except Exception as e:
-        logger.error(f"[redis] hset failed for {key}/{field}: {e}")
-        return False
+    result = _post(["HSET", key, field, value])
+    return result.get("result") is not None
 
 
 def redis_hget(key: str, field: str) -> str | None:
-    """Get a hash field."""
-    try:
-        url = f"{REDIS_URL}/hget/{key}/{field}"
-        r = requests.get(url, headers=_headers(), timeout=5)
-        if r.status_code == 200:
-            return r.json().get("result")
-        return None
-    except Exception as e:
-        logger.error(f"[redis] hget failed for {key}/{field}: {e}")
-        return None
+    result = _post(["HGET", key, field])
+    return result.get("result")
 
 
 def redis_hgetall(key: str) -> dict:
-    """Get all hash fields and values."""
-    try:
-        url = f"{REDIS_URL}/hgetall/{key}"
-        r = requests.get(url, headers=_headers(), timeout=5)
-        if r.status_code == 200:
-            result = r.json().get("result", [])
-            # Upstash returns flat list [field, value, field, value...]
-            return dict(zip(result[::2], result[1::2])) if result else {}
+    result = _post(["HGETALL", key])
+    raw = result.get("result", [])
+    if not raw or not isinstance(raw, list):
         return {}
-    except Exception as e:
-        logger.error(f"[redis] hgetall failed for {key}: {e}")
-        return {}
+    # Upstash returns flat list [field, value, field, value...]
+    # Only keep clean symbol-like field names, skip JSON fragments
+    pairs = {}
+    it = iter(raw)
+    for field in it:
+        try:
+            value = next(it)
+            if isinstance(field, str) and not field.startswith("{"):
+                pairs[field] = value
+        except StopIteration:
+            break
+    return pairs
 
 
 def redis_hdel(key: str, field: str) -> bool:
-    """Delete a hash field."""
-    try:
-        url = f"{REDIS_URL}/hdel/{key}/{field}"
-        r = requests.get(url, headers=_headers(), timeout=5)
-        return r.status_code == 200
-    except Exception as e:
-        logger.error(f"[redis] hdel failed for {key}/{field}: {e}")
-        return False
+    result = _post(["HDEL", key, field])
+    return bool(result.get("result"))
+
+
+def redis_keys(pattern: str) -> list[str]:
+    """Get all keys matching a pattern."""
+    result = _post(["KEYS", pattern])
+    return result.get("result", [])
+
+
+def redis_flushall() -> bool:
+    """Flush all keys — use carefully."""
+    result = _post(["FLUSHDB"])
+    return result.get("result") == "OK"
