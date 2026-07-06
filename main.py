@@ -1,12 +1,12 @@
 """
 Main scanner with:
-- Single exchange signals fire if confidence >= 75%
+- Single exchange signals fire if confidence >= 65%
 - Cross-exchange confirmation boosts confidence by 10%
 - Reversal alerts for opposing signals on active trades
 - AI filter selects best 1-2 signals per cycle
-- Daily limit: max 15 signals per day
+- Daily limit: max 15 signals per day (Redis backed)
 - Active trade protection per symbol
-- Daily summary sent at midnight UTC
+- Daily summary sent once at midnight UTC (Redis dedup)
 """
 
 import asyncio
@@ -21,6 +21,7 @@ from bot.notifier import send_signal
 from bot.tracker import SignalTracker
 from bot.ai_filter import ai_select_signals, get_daily_count, remaining_today, MAX_SIGNALS_PER_DAY
 from bot.summary import record_signal_sent, record_result, format_daily_summary
+from bot.redis_client import redis_get, redis_set
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,7 +31,6 @@ logger = logging.getLogger("scanner")
 
 tracker = SignalTracker()
 _exchange_cache: dict = {}
-_last_summary_date: str = ""
 
 
 def required_confidence(symbol: str) -> float:
@@ -62,7 +62,6 @@ def get_base_symbol(symbol: str) -> str:
 
 
 async def send_daily_summary():
-    """Sends the daily performance summary to Telegram."""
     from telegram import Bot
     from telegram.constants import ParseMode
     bot = Bot(token=Config.TELEGRAM_BOT_TOKEN)
@@ -79,15 +78,16 @@ async def send_daily_summary():
 
 
 async def check_and_send_summary():
-    """Sends summary at midnight UTC once per day."""
-    global _last_summary_date
+    """Sends summary at midnight UTC — Redis deduplication prevents doubles."""
     now = datetime.now(timezone.utc)
     today = str(now.date())
 
-    # Send at midnight — between 00:00 and 00:10 UTC
-    if now.hour == 0 and now.minute < 10 and _last_summary_date != today:
-        _last_summary_date = today
-        await send_daily_summary()
+    if now.hour == 0 and now.minute < 10:
+        sent_key = f"summary_sent:{today}"
+        already_sent = redis_get(sent_key)
+        if not already_sent:
+            redis_set(sent_key, "1", ex=86400)
+            await send_daily_summary()
 
 
 async def scan_all_exchanges():
@@ -96,7 +96,6 @@ async def scan_all_exchanges():
         logger.info(f"Daily limit reached ({MAX_SIGNALS_PER_DAY}) — skipping scan")
         return
 
-    # {base_symbol: {exchange_id: (Signal, df_15m)}}
     exchange_signals: dict[str, dict[str, tuple]] = defaultdict(dict)
 
     for exchange_id in Config.EXCHANGES:
@@ -147,13 +146,11 @@ async def scan_all_exchanges():
 
     for base, ex_sigs in exchange_signals.items():
 
-        # Check direction agreement
         directions = [sig.direction for sig, _ in ex_sigs.values()]
         if len(set(directions)) > 1:
-            logger.debug(f"{base}: exchanges disagree on direction — skipped")
+            logger.debug(f"{base}: exchanges disagree — skipped")
             continue
 
-        # Pick highest confidence signal
         best_sig, best_df = max(
             ex_sigs.values(),
             key=lambda x: x[0].confidence
@@ -162,7 +159,6 @@ async def scan_all_exchanges():
         num_agreeing = len(ex_sigs)
 
         if num_agreeing == num_exchanges:
-            # All exchanges agree — boost confidence 10%
             best_sig.confidence = min(100.0, round(best_sig.confidence * 1.1, 1))
             best_sig.exchange = "confirmed"
             logger.info(
@@ -170,7 +166,6 @@ async def scan_all_exchanges():
                 f"confidence boosted to {best_sig.confidence}%"
             )
         elif best_sig.confidence >= 65:
-            # Single exchange high confidence — accept
             best_sig.exchange = "confirmed"
             logger.info(
                 f"{base}: single exchange conf={best_sig.confidence} — accepted"
@@ -178,11 +173,10 @@ async def scan_all_exchanges():
         else:
             logger.debug(
                 f"{base}: single exchange conf={best_sig.confidence} "
-                f"< 75 — skipped"
+                f"< 65 — skipped"
             )
             continue
 
-        # Check active trade on this symbol
         full_symbol = best_sig.symbol
         if tracker.is_symbol_active(full_symbol):
             active = tracker.get_active_trade(full_symbol)
@@ -206,8 +200,8 @@ async def scan_all_exchanges():
         confirmed_signals.append((best_sig, best_df))
 
     logger.info(
-        f"Confirmed signals: {len(confirmed_signals)} | "
-        f"Reversal alerts: {len(reversal_signals)} | "
+        f"Confirmed: {len(confirmed_signals)} | "
+        f"Reversals: {len(reversal_signals)} | "
         f"Daily: {get_daily_count()}/{MAX_SIGNALS_PER_DAY}"
     )
 
