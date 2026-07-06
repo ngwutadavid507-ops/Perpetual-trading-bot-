@@ -31,7 +31,6 @@ EXCHANGE_CLASS_MAP = {
     }),
 }
 
-# Tokens to always block regardless of top list
 JUNK_PREFIXES = [
     "NC", "EUR", "GBP", "SGD", "JPY", "AUD",
     "USD2", "2USD", "BVOL", "DVOL", "PIE", "WLFI",
@@ -40,6 +39,10 @@ JUNK_PREFIXES = [
 JUNK_EXACT = {
     "PIEVERSE", "WLFI", "EURI", "EURC", "FDUSD",
     "TUSD", "BUSD", "USDP", "GUSD", "HUSD",
+    "NIGHT", "CC", "MON", "ASTER", "SKY", "ACE",
+    "LEVER", "COMBO", "VIDT", "HIGH", "LAZIO",
+    "PORTO", "ALPINE", "CITY", "SANTOS", "PSG",
+    "ATM", "OG", "TBT", "INTER", "JUV", "BAR",
 }
 
 
@@ -62,7 +65,6 @@ def get_liquid_perp_symbols(exchange, min_24h_volume_usdt: float) -> list[str]:
     candidates = []
     for symbol, m in markets.items():
 
-        # Must be active linear USDT-settled perpetual swap
         if not m.get("swap"):
             continue
         if not m.get("linear"):
@@ -71,8 +73,6 @@ def get_liquid_perp_symbols(exchange, min_24h_volume_usdt: float) -> list[str]:
             continue
         if not m.get("active", True):
             continue
-
-        # Block options and dated contracts
         if m.get("type") == "option":
             continue
         if m.get("expiry") is not None:
@@ -82,15 +82,12 @@ def get_liquid_perp_symbols(exchange, min_24h_volume_usdt: float) -> list[str]:
 
         base = m.get("base", "").upper()
 
-        # Block junk by prefix
         if any(base.startswith(j) for j in JUNK_PREFIXES):
             continue
 
-        # Block junk by exact match
         if base in JUNK_EXACT:
             continue
 
-        # Only allow top symbols
         if top_symbols and not is_top_symbol(base, top_symbols):
             continue
 
@@ -149,7 +146,6 @@ def fetch_dual_timeframe(
     exchange,
     symbol: str,
 ) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
-    """Fetches both 1h and 15m candles for a symbol."""
     df_1h = fetch_ohlcv_df(exchange, symbol, "1h", limit=150)
     df_15m = fetch_ohlcv_df(exchange, symbol, "15m", limit=100)
     return df_1h, df_15m
