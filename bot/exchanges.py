@@ -1,8 +1,8 @@
 """
-Unified exchange access using ccxt. Fetches both 1h and 15m candles
-for multi-timeframe signal analysis. Filters out options, futures with
-expiry, synthetic/forex tokens, and known junk tokens.
-Only scans USDT linear perpetual swaps in the top symbol list.
+Unified exchange access using ccxt.
+Fetches 1h for trend and 5m for entry signals.
+Filters out options, synthetics, forex and junk tokens.
+Only scans USDT linear perpetual swaps in top symbol list.
 """
 
 import logging
@@ -64,7 +64,6 @@ def get_liquid_perp_symbols(exchange, min_24h_volume_usdt: float) -> list[str]:
 
     candidates = []
     for symbol, m in markets.items():
-
         if not m.get("swap"):
             continue
         if not m.get("linear"):
@@ -84,10 +83,8 @@ def get_liquid_perp_symbols(exchange, min_24h_volume_usdt: float) -> list[str]:
 
         if any(base.startswith(j) for j in JUNK_PREFIXES):
             continue
-
         if base in JUNK_EXACT:
             continue
-
         if top_symbols and not is_top_symbol(base, top_symbols):
             continue
 
@@ -146,6 +143,10 @@ def fetch_dual_timeframe(
     exchange,
     symbol: str,
 ) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    """
+    Fetches 1h for trend direction and S/R levels.
+    Fetches 5m for entry timing and pattern detection.
+    """
     df_1h = fetch_ohlcv_df(exchange, symbol, "1h", limit=150)
-    df_15m = fetch_ohlcv_df(exchange, symbol, "15m", limit=100)
-    return df_1h, df_15m
+    df_5m = fetch_ohlcv_df(exchange, symbol, "5m", limit=100)
+    return df_1h, df_5m
