@@ -1,7 +1,8 @@
 """
 Signal result tracker — Redis backed, survives Railway restarts.
-Tracks open signals, sends TP/SL notifications,
-records results for daily summary, handles reversals.
+- Blocks same direction signals on active trades
+- Sends reversal alert for opposing signals with high confidence
+- Tracks TP1/TP2/TP3/SL and sends result notifications
 """
 
 import json
@@ -12,7 +13,7 @@ from datetime import datetime, timedelta
 from bot.signal_engine import Signal
 from bot.notifier import send_result, send_reversal_alert
 from bot.summary import record_result
-from bot.redis_client import redis_hset, redis_hget, redis_hgetall, redis_hdel, redis_set, redis_get
+from bot.redis_client import redis_hset, redis_hget, redis_hgetall, redis_hdel
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,11 @@ def _load_tracked(symbol: str) -> TrackedSignal | None:
     if not raw:
         return None
     try:
+        # Handle case where raw might be truncated or corrupted
+        if not raw.strip().startswith("{"):
+            logger.warning(f"[tracker] corrupted data for {symbol} — removing")
+            redis_hdel(TRACKER_KEY, symbol)
+            return None
         data = json.loads(raw)
         sig = _dict_to_sig(data["signal"])
         return TrackedSignal(
@@ -84,10 +90,13 @@ def _load_tracked(symbol: str) -> TrackedSignal | None:
             tp1_hit=data.get("tp1_hit", False),
             tp2_hit=data.get("tp2_hit", False),
             tp3_hit=data.get("tp3_hit", False),
-            opened_at=datetime.fromisoformat(data.get("opened_at", datetime.utcnow().isoformat())),
+            opened_at=datetime.fromisoformat(
+                data.get("opened_at", datetime.utcnow().isoformat())
+            ),
         )
     except Exception as e:
-        logger.error(f"[tracker] failed to load {symbol}: {e}")
+        logger.error(f"[tracker] failed to load {symbol}: {e} — removing corrupted entry")
+        redis_hdel(TRACKER_KEY, symbol)
         return None
 
 
@@ -119,7 +128,8 @@ class SignalTracker:
         logger.info(f"[tracker] tracking {sig.symbol} {sig.direction}")
 
     def is_symbol_active(self, symbol: str) -> bool:
-        return redis_hget(TRACKER_KEY, symbol) is not None
+        tracked = _load_tracked(symbol)
+        return tracked is not None
 
     def get_active_trade(self, symbol: str) -> TrackedSignal | None:
         return _load_tracked(symbol)
@@ -171,10 +181,12 @@ class SignalTracker:
         for symbol in symbols:
             tracked = _load_tracked(symbol)
             if not tracked:
+                # Already cleaned up by _load_tracked
                 continue
 
             sig = tracked.signal
 
+            # Expire old signals
             age = datetime.utcnow() - tracked.opened_at
             if age > timedelta(hours=MAX_SIGNAL_AGE_HOURS):
                 await send_result(
@@ -205,7 +217,10 @@ class SignalTracker:
             if sig.direction == "long":
                 if price <= sig.stop_loss:
                     pnl_r = round((price - sig.entry) / risk, 2)
-                    await send_result(bot_token, chat_id, sig.symbol, sig.direction, "sl", pnl_r)
+                    await send_result(
+                        bot_token, chat_id,
+                        sig.symbol, sig.direction, "sl", pnl_r
+                    )
                     record_result(sig.symbol, sig.direction, "sl", pnl_r)
                     self.close(symbol)
                     logger.info(f"[tracker] SL: {symbol} {pnl_r}R")
@@ -214,7 +229,10 @@ class SignalTracker:
                 if not tracked.tp1_hit and price >= sig.take_profit1:
                     tracked.tp1_hit = True
                     pnl_r = round((sig.take_profit1 - sig.entry) / risk, 2)
-                    await send_result(bot_token, chat_id, sig.symbol, sig.direction, "tp1", pnl_r)
+                    await send_result(
+                        bot_token, chat_id,
+                        sig.symbol, sig.direction, "tp1", pnl_r
+                    )
                     record_result(sig.symbol, sig.direction, "tp1", pnl_r)
                     logger.info(f"[tracker] TP1: {symbol} +{pnl_r}R")
                     changed = True
@@ -222,7 +240,10 @@ class SignalTracker:
                 if tracked.tp1_hit and not tracked.tp2_hit and price >= sig.take_profit2:
                     tracked.tp2_hit = True
                     pnl_r = round((sig.take_profit2 - sig.entry) / risk, 2)
-                    await send_result(bot_token, chat_id, sig.symbol, sig.direction, "tp2", pnl_r)
+                    await send_result(
+                        bot_token, chat_id,
+                        sig.symbol, sig.direction, "tp2", pnl_r
+                    )
                     record_result(sig.symbol, sig.direction, "tp2", pnl_r)
                     logger.info(f"[tracker] TP2: {symbol} +{pnl_r}R")
                     changed = True
@@ -230,7 +251,10 @@ class SignalTracker:
                 if tracked.tp2_hit and not tracked.tp3_hit and price >= sig.take_profit3:
                     tracked.tp3_hit = True
                     pnl_r = round((sig.take_profit3 - sig.entry) / risk, 2)
-                    await send_result(bot_token, chat_id, sig.symbol, sig.direction, "tp3", pnl_r)
+                    await send_result(
+                        bot_token, chat_id,
+                        sig.symbol, sig.direction, "tp3", pnl_r
+                    )
                     record_result(sig.symbol, sig.direction, "tp3", pnl_r)
                     self.close(symbol)
                     logger.info(f"[tracker] TP3: {symbol} +{pnl_r}R")
@@ -239,7 +263,10 @@ class SignalTracker:
             else:
                 if price >= sig.stop_loss:
                     pnl_r = round((sig.entry - price) / risk, 2)
-                    await send_result(bot_token, chat_id, sig.symbol, sig.direction, "sl", pnl_r)
+                    await send_result(
+                        bot_token, chat_id,
+                        sig.symbol, sig.direction, "sl", pnl_r
+                    )
                     record_result(sig.symbol, sig.direction, "sl", pnl_r)
                     self.close(symbol)
                     logger.info(f"[tracker] SL: {symbol} {pnl_r}R")
@@ -248,7 +275,10 @@ class SignalTracker:
                 if not tracked.tp1_hit and price <= sig.take_profit1:
                     tracked.tp1_hit = True
                     pnl_r = round((sig.entry - sig.take_profit1) / risk, 2)
-                    await send_result(bot_token, chat_id, sig.symbol, sig.direction, "tp1", pnl_r)
+                    await send_result(
+                        bot_token, chat_id,
+                        sig.symbol, sig.direction, "tp1", pnl_r
+                    )
                     record_result(sig.symbol, sig.direction, "tp1", pnl_r)
                     logger.info(f"[tracker] TP1: {symbol} +{pnl_r}R")
                     changed = True
@@ -256,7 +286,10 @@ class SignalTracker:
                 if tracked.tp1_hit and not tracked.tp2_hit and price <= sig.take_profit2:
                     tracked.tp2_hit = True
                     pnl_r = round((sig.entry - sig.take_profit2) / risk, 2)
-                    await send_result(bot_token, chat_id, sig.symbol, sig.direction, "tp2", pnl_r)
+                    await send_result(
+                        bot_token, chat_id,
+                        sig.symbol, sig.direction, "tp2", pnl_r
+                    )
                     record_result(sig.symbol, sig.direction, "tp2", pnl_r)
                     logger.info(f"[tracker] TP2: {symbol} +{pnl_r}R")
                     changed = True
@@ -264,12 +297,14 @@ class SignalTracker:
                 if tracked.tp2_hit and not tracked.tp3_hit and price <= sig.take_profit3:
                     tracked.tp3_hit = True
                     pnl_r = round((sig.entry - sig.take_profit3) / risk, 2)
-                    await send_result(bot_token, chat_id, sig.symbol, sig.direction, "tp3", pnl_r)
+                    await send_result(
+                        bot_token, chat_id,
+                        sig.symbol, sig.direction, "tp3", pnl_r
+                    )
                     record_result(sig.symbol, sig.direction, "tp3", pnl_r)
                     self.close(symbol)
                     logger.info(f"[tracker] TP3: {symbol} +{pnl_r}R")
                     continue
 
-            # Save updated state if TP flags changed
             if changed:
                 _save_tracked(symbol, tracked)
