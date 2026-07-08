@@ -1,34 +1,42 @@
 """
-Multi-timeframe signal engine with 3 TP levels.
-- 1h candles: trend direction and S/R zones
-- 5m candles: entry timing, pattern confirmation (faster signals)
-- TP1 = 3x risk, TP2 = 5x risk, TP3 = 7x risk
-- SL placed beyond last 5 candle swing point (tight)
-- Higher leverage table for 5m trading
-- Redis-backed duplicate cache survives Railway restarts
+V2 Signal Engine.
+Combines both strategies:
+- Trend Continuation (min 65% confidence)
+- Reversal (min 80% confidence)
+
+Each signal includes:
+- Strategy type (continuation/reversal)
+- Live price validation before firing
+- News sentiment check
+- TP1=3x, TP2=5x, TP3=7x risk
+- Dynamic leverage based on confidence and volatility
+- Redis-backed duplicate prevention
 """
 
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-import pandas as pd
-import numpy as np
 
-from bot.patterns import detect_engulfing, detect_pin_bar
-from bot.indicators import add_indicators, find_support_resistance, nearest_level
+import pandas as pd
+
+from bot.indicators import add_indicators, find_support_resistance
+from bot.strategy_continuation import score_continuation
+from bot.strategy_reversal import score_reversal
+from bot.news_filter import should_block_signal, get_confidence_boost
 from bot.redis_client import redis_get, redis_set
+from config.settings import Config
 
 logger = logging.getLogger(__name__)
 
-COOLDOWN_KEY_PREFIX = "cooldown:"
+COOLDOWN_KEY_PREFIX = "cooldown:v2:"
 
 
-def _is_duplicate(symbol: str, direction: str, cooldown_minutes: int) -> bool:
+def _is_duplicate(symbol: str, direction: str) -> bool:
     key = f"{COOLDOWN_KEY_PREFIX}{symbol}_{direction}"
     existing = redis_get(key)
     if existing:
         return True
-    redis_set(key, "1", ex=cooldown_minutes * 60)
+    redis_set(key, "1", ex=Config.SIGNAL_COOLDOWN_MINUTES * 60)
     return False
 
 
@@ -37,6 +45,7 @@ class Signal:
     symbol: str
     exchange: str
     direction: str
+    strategy_type: str          # 'continuation' or 'reversal'
     confidence: float
     entry: float
     stop_loss: float
@@ -49,6 +58,7 @@ class Signal:
     tp3_pct: float
     leverage: int
     reasons: list[str]
+    news_sentiment: str         # 'bullish', 'bearish', 'neutral'
     fired_at: datetime = field(default_factory=datetime.utcnow)
 
 
@@ -60,182 +70,44 @@ def _calculate_volatility(df: pd.DataFrame) -> str:
     return "high" if (atr / price) * 100 >= 1.5 else "low"
 
 
-def _calculate_leverage(confidence: float, volatility: str) -> int:
-    if confidence >= 85:
-        return 50 if volatility == "low" else 35
-    elif confidence >= 80:
-        return 35 if volatility == "low" else 25
-    elif confidence >= 75:
-        return 25 if volatility == "low" else 20
-    elif confidence >= 70:
-        return 20 if volatility == "low" else 15
+def _calculate_leverage(
+    confidence: float,
+    volatility: str,
+    strategy_type: str,
+) -> int:
+    """
+    Dynamic leverage based on confidence, volatility and strategy type.
+    Reversals get slightly lower leverage due to lower win rate.
+    """
+    if strategy_type == "reversal":
+        if confidence >= 90:
+            return 35 if volatility == "low" else 25
+        elif confidence >= 85:
+            return 25 if volatility == "low" else 20
+        elif confidence >= 80:
+            return 20 if volatility == "low" else 15
+        else:
+            return 15 if volatility == "low" else 10
     else:
-        return 15 if volatility == "low" else 10
-
-
-def _get_1h_trend(df_1h: pd.DataFrame) -> str:
-    """Determines trend from 1h candles."""
-    df = add_indicators(df_1h)
-    last = df.iloc[-1]
-    price = last["close"]
-    ma_fast = last.get("ma_fast")
-    ma_mid = last.get("ma_mid")
-    if not ma_fast or not ma_mid:
-        return "sideways"
-    if ma_fast > ma_mid and price > ma_mid:
-        return "uptrend"
-    elif ma_fast < ma_mid and price < ma_mid:
-        return "downtrend"
-    return "sideways"
-
-
-def _get_1h_levels(df_1h: pd.DataFrame) -> tuple[list, list]:
-    """Gets S/R levels from 1h candles for TP targets."""
-    df = add_indicators(df_1h)
-    return find_support_resistance(df, lookback=80)
+        # Continuation
+        if confidence >= 85:
+            return 50 if volatility == "low" else 35
+        elif confidence >= 80:
+            return 35 if volatility == "low" else 25
+        elif confidence >= 75:
+            return 25 if volatility == "low" else 20
+        elif confidence >= 70:
+            return 20 if volatility == "low" else 15
+        else:
+            return 15 if volatility == "low" else 10
 
 
 def _calculate_sl(df_5m: pd.DataFrame, direction: str) -> float:
-    """
-    Places SL beyond last 5 candle swing point — tight for 5m trading.
-    Long: below lowest low of last 5 candles.
-    Short: above highest high of last 5 candles.
-    """
+    """Tight SL beyond last 5 candle swing point."""
     if direction == "long":
         return round(df_5m["low"].tail(5).min() * 0.998, 6)
     else:
         return round(df_5m["high"].tail(5).max() * 1.002, 6)
-
-
-def _is_after_impulse(df_5m: pd.DataFrame, direction: str) -> bool:
-    """
-    Checks if price made a meaningful move before signal candle.
-    Prevents signals in choppy sideways price action.
-    """
-    if "atr" not in df_5m.columns:
-        return True
-    atr = df_5m["atr"].iloc[-1]
-    if pd.isna(atr) or atr == 0:
-        return True
-    recent = df_5m.tail(6).iloc[:-1]
-    if direction == "short":
-        move = recent["close"].iloc[0] - recent["close"].iloc[-1]
-    else:
-        move = recent["close"].iloc[-1] - recent["close"].iloc[0]
-    return move >= atr * 0.4
-
-
-def _candle_is_significant(df_5m: pd.DataFrame) -> bool:
-    """
-    Signal candle body must be at least 15% of recent ATR.
-    Filters noise on 5m timeframe.
-    """
-    if "atr" not in df_5m.columns:
-        return True
-    last = df_5m.iloc[-1]
-    atr = df_5m["atr"].iloc[-1]
-    if pd.isna(atr) or atr == 0:
-        return True
-    body = abs(last["close"] - last["open"])
-    return body >= atr * 0.15
-
-
-def _score_5m(
-    df_5m: pd.DataFrame,
-    allowed_direction: str,
-    support_1h: list,
-    resistance_1h: list,
-) -> tuple[float, list[str]]:
-    """
-    Scores the 5m candle setup in the allowed direction.
-    Returns (confidence_0_to_100, reasons).
-    """
-    df = add_indicators(df_5m)
-    last = df.iloc[-1]
-    price = last["close"]
-    score = 0
-    max_score = 0
-    reasons = []
-
-    # Candle significance check
-    if not _candle_is_significant(df):
-        return 0, []
-
-    # --- Candle pattern (30 pts) — required ---
-    max_score += 30
-    engulf = detect_engulfing(df)
-    pin = detect_pin_bar(df)
-    pattern = engulf or pin
-    pattern_name = "Engulfing" if engulf else "Pin bar"
-
-    if pattern == "bullish" and allowed_direction == "long":
-        score += 30
-        reasons.append(f"{pattern_name} bullish reversal on 5m")
-    elif pattern == "bearish" and allowed_direction == "short":
-        score += 30
-        reasons.append(f"{pattern_name} bearish reversal on 5m")
-    else:
-        return 0, []
-
-    # Impulse move check
-    if not _is_after_impulse(df, allowed_direction):
-        return 0, []
-
-    # --- 1H S/R proximity (25 pts) ---
-    max_score += 25
-    near_support = nearest_level(price, support_1h, "below")
-    near_resistance = nearest_level(price, resistance_1h, "above")
-
-    if allowed_direction == "long" and near_support:
-        if abs(price - near_support) / price * 100 <= 1.5:
-            score += 25
-            reasons.append(f"1H support zone ~{near_support:.4f}")
-
-    if allowed_direction == "short" and near_resistance:
-        if abs(near_resistance - price) / price * 100 <= 1.5:
-            score += 25
-            reasons.append(f"1H resistance zone ~{near_resistance:.4f}")
-
-    # --- RSI (20 pts) with contradiction block ---
-    max_score += 20
-    rsi = last.get("rsi")
-    if rsi is not None:
-        if allowed_direction == "long":
-            if rsi >= 78:
-                return 0, []
-            if rsi <= 45:
-                score += 20
-                reasons.append(f"RSI oversold ({rsi:.1f})")
-        elif allowed_direction == "short":
-            if rsi <= 22:
-                return 0, []
-            if rsi >= 55:
-                score += 20
-                reasons.append(f"RSI overbought ({rsi:.1f})")
-
-    # --- 5m MA structure (15 pts) ---
-    max_score += 15
-    ma_fast = last.get("ma_fast")
-    ma_mid = last.get("ma_mid")
-    if ma_fast and ma_mid:
-        if allowed_direction == "long" and ma_fast > ma_mid and price > ma_fast:
-            score += 15
-            reasons.append("5m uptrend structure confirmed")
-        elif allowed_direction == "short" and ma_fast < ma_mid and price < ma_fast:
-            score += 15
-            reasons.append("5m downtrend structure confirmed")
-
-    # --- Volume (10 pts) ---
-    max_score += 10
-    vol_avg = last.get("vol_avg20")
-    if vol_avg and vol_avg > 0 and last["volume"] > vol_avg * 1.3:
-        score += 10
-        reasons.append("Volume spike confirms move")
-
-    if not reasons:
-        return 0, []
-
-    return round(score / max_score * 100, 1), reasons
 
 
 def build_signal(
@@ -243,95 +115,194 @@ def build_signal(
     exchange_id: str,
     df_1h: pd.DataFrame,
     df_5m: pd.DataFrame,
-    min_risk_reward: float,
-    cooldown_minutes: int = 30,
+    live_price: float | None = None,
 ) -> Signal | None:
-
+    """
+    Main signal builder. Tries both strategies and returns
+    the highest confidence qualifying signal, or None.
+    """
     if df_1h is None or df_5m is None:
         return None
     if len(df_1h) < 50 or len(df_5m) < 50:
         return None
 
-    # Step 1 — 1H trend direction
-    trend_1h = _get_1h_trend(df_1h)
-    if trend_1h == "uptrend":
-        directions_to_try = ["long"]
-    elif trend_1h == "downtrend":
-        directions_to_try = ["short"]
-    else:
-        directions_to_try = ["long", "short"]
+    # Get 1H S/R levels — shared by both strategies
+    df_1h_ind = add_indicators(df_1h)
+    support_1h, resistance_1h = find_support_resistance(
+        df_1h_ind, lookback=80, min_touches=2
+    )
 
-    # Step 2 — 1H S/R levels for TP targets
-    support_1h, resistance_1h = _get_1h_levels(df_1h)
-
-    # Step 3 — 5m indicators
     df_5m_ind = add_indicators(df_5m)
-    best_sig = None
+    current_price = live_price if live_price else df_5m_ind["close"].iloc[-1]
+
+    best_signal = None
     best_confidence = 0
 
-    for direction in directions_to_try:
+    # ── Try Continuation Strategy ─────────────────────────────────────────────
+    cont_direction, cont_confidence, cont_reasons = score_continuation(
+        df_1h, df_5m, support_1h, resistance_1h
+    )
 
-        # Step 4 — score 5m setup
-        confidence, reasons = _score_5m(
-            df_5m, direction, support_1h, resistance_1h
-        )
-        if confidence == 0 or not reasons:
-            continue
+    if (cont_direction and
+            cont_confidence >= Config.MIN_CONFIDENCE_CONTINUATION and
+            cont_confidence > best_confidence):
 
-        if confidence <= best_confidence:
-            continue
+        if not _is_duplicate(symbol, cont_direction):
 
-        # Step 5 — duplicate check
-        if _is_duplicate(symbol, direction, cooldown_minutes):
-            continue
+            # Live price validation
+            if live_price:
+                candle_price = df_5m_ind["close"].iloc[-1]
+                slippage = abs(live_price - candle_price) / candle_price * 100
+                if slippage > Config.MAX_ENTRY_SLIPPAGE_PCT:
+                    logger.info(
+                        f"{symbol}: continuation signal discarded — "
+                        f"slippage {slippage:.2f}% > "
+                        f"{Config.MAX_ENTRY_SLIPPAGE_PCT}%"
+                    )
+                else:
+                    # News sentiment check
+                    base = symbol.split("/")[0]
+                    blocked, block_reason = should_block_signal(
+                        base, cont_direction, Config.NEWS_LOOKBACK_HOURS
+                    )
+                    if blocked:
+                        logger.info(
+                            f"{symbol}: continuation blocked by news — "
+                            f"{block_reason}"
+                        )
+                    else:
+                        news_boost = get_confidence_boost(
+                            base, cont_direction, Config.NEWS_LOOKBACK_HOURS
+                        )
+                        cont_confidence = min(100.0, cont_confidence + news_boost)
+                        if news_boost > 0:
+                            cont_reasons.append(
+                                f"News sentiment confirms {cont_direction} "
+                                f"(+{news_boost}% confidence)"
+                            )
 
-        # Step 6 — tight SL from 5m swing
-        price = df_5m_ind["close"].iloc[-1]
-        stop_loss = _calculate_sl(df_5m_ind, direction)
-        risk = abs(price - stop_loss)
-        if risk == 0:
-            continue
+                        best_confidence = cont_confidence
+                        best_signal = (
+                            cont_direction, cont_confidence,
+                            cont_reasons, "continuation"
+                        )
+            else:
+                base = symbol.split("/")[0]
+                blocked, block_reason = should_block_signal(
+                    base, cont_direction, Config.NEWS_LOOKBACK_HOURS
+                )
+                if not blocked:
+                    news_boost = get_confidence_boost(
+                        base, cont_direction, Config.NEWS_LOOKBACK_HOURS
+                    )
+                    cont_confidence = min(100.0, cont_confidence + news_boost)
+                    best_confidence = cont_confidence
+                    best_signal = (
+                        cont_direction, cont_confidence,
+                        cont_reasons, "continuation"
+                    )
 
-        # Step 7 — TP at 3x, 5x, 7x risk
-        if direction == "long":
-            entry = price
-            take_profit1 = round(entry + (risk * 3), 6)
-            take_profit2 = round(entry + (risk * 5), 6)
-            take_profit3 = round(entry + (risk * 7), 6)
-        else:
-            entry = price
-            take_profit1 = round(entry - (risk * 3), 6)
-            take_profit2 = round(entry - (risk * 5), 6)
-            take_profit3 = round(entry - (risk * 7), 6)
+    # ── Try Reversal Strategy ─────────────────────────────────────────────────
+    rev_direction, rev_confidence, rev_reasons = score_reversal(
+        df_1h, df_5m, support_1h, resistance_1h
+    )
 
-        sl_pct = round(abs(entry - stop_loss) / entry * 100, 3)
-        tp1_pct = round(abs(take_profit1 - entry) / entry * 100, 3)
-        tp2_pct = round(abs(take_profit2 - entry) / entry * 100, 3)
-        tp3_pct = round(abs(take_profit3 - entry) / entry * 100, 3)
+    if (rev_direction and
+            rev_confidence >= Config.MIN_CONFIDENCE_REVERSAL and
+            rev_confidence > best_confidence):
 
-        if trend_1h != "sideways":
-            reasons.insert(0, f"1H {trend_1h} confirmed")
+        if not _is_duplicate(symbol, rev_direction):
 
-        volatility = _calculate_volatility(df_5m_ind)
-        leverage = _calculate_leverage(confidence, volatility)
+            if live_price:
+                candle_price = df_5m_ind["close"].iloc[-1]
+                slippage = abs(live_price - candle_price) / candle_price * 100
+                if slippage <= Config.MAX_ENTRY_SLIPPAGE_PCT:
+                    base = symbol.split("/")[0]
+                    blocked, block_reason = should_block_signal(
+                        base, rev_direction, Config.NEWS_LOOKBACK_HOURS
+                    )
+                    if not blocked:
+                        news_boost = get_confidence_boost(
+                            base, rev_direction, Config.NEWS_LOOKBACK_HOURS
+                        )
+                        rev_confidence = min(100.0, rev_confidence + news_boost)
+                        if news_boost > 0:
+                            rev_reasons.append(
+                                f"News sentiment confirms {rev_direction} "
+                                f"(+{news_boost}% confidence)"
+                            )
+                        best_confidence = rev_confidence
+                        best_signal = (
+                            rev_direction, rev_confidence,
+                            rev_reasons, "reversal"
+                        )
+            else:
+                base = symbol.split("/")[0]
+                blocked, _ = should_block_signal(
+                    base, rev_direction, Config.NEWS_LOOKBACK_HOURS
+                )
+                if not blocked:
+                    news_boost = get_confidence_boost(
+                        base, rev_direction, Config.NEWS_LOOKBACK_HOURS
+                    )
+                    rev_confidence = min(100.0, rev_confidence + news_boost)
+                    best_confidence = rev_confidence
+                    best_signal = (
+                        rev_direction, rev_confidence,
+                        rev_reasons, "reversal"
+                    )
 
-        best_confidence = confidence
-        best_sig = Signal(
-            symbol=symbol,
-            exchange=exchange_id,
-            direction=direction,
-            confidence=confidence,
-            entry=round(entry, 6),
-            stop_loss=stop_loss,
-            take_profit1=take_profit1,
-            take_profit2=take_profit2,
-            take_profit3=take_profit3,
-            sl_pct=sl_pct,
-            tp1_pct=tp1_pct,
-            tp2_pct=tp2_pct,
-            tp3_pct=tp3_pct,
-            leverage=leverage,
-            reasons=reasons,
-        )
+    if not best_signal:
+        return None
 
-    return best_sig
+    direction, confidence, reasons, strategy_type = best_signal
+
+    # Build entry, SL, TPs
+    entry = current_price
+    stop_loss = _calculate_sl(df_5m_ind, direction)
+    risk = abs(entry - stop_loss)
+
+    if risk == 0:
+        return None
+
+    if direction == "long":
+        take_profit1 = round(entry + (risk * 3), 6)
+        take_profit2 = round(entry + (risk * 5), 6)
+        take_profit3 = round(entry + (risk * 7), 6)
+    else:
+        take_profit1 = round(entry - (risk * 3), 6)
+        take_profit2 = round(entry - (risk * 5), 6)
+        take_profit3 = round(entry - (risk * 7), 6)
+
+    sl_pct = round(abs(entry - stop_loss) / entry * 100, 3)
+    tp1_pct = round(abs(take_profit1 - entry) / entry * 100, 3)
+    tp2_pct = round(abs(take_profit2 - entry) / entry * 100, 3)
+    tp3_pct = round(abs(take_profit3 - entry) / entry * 100, 3)
+
+    volatility = _calculate_volatility(df_5m_ind)
+    leverage = _calculate_leverage(confidence, volatility, strategy_type)
+
+    # Get news sentiment for signal display
+    base = symbol.split("/")[0]
+    from bot.news_filter import get_news_sentiment
+    news_sentiment, _ = get_news_sentiment(base, Config.NEWS_LOOKBACK_HOURS)
+
+    return Signal(
+        symbol=symbol,
+        exchange=exchange_id,
+        direction=direction,
+        strategy_type=strategy_type,
+        confidence=confidence,
+        entry=round(entry, 6),
+        stop_loss=round(stop_loss, 6),
+        take_profit1=take_profit1,
+        take_profit2=take_profit2,
+        take_profit3=take_profit3,
+        sl_pct=sl_pct,
+        tp1_pct=tp1_pct,
+        tp2_pct=tp2_pct,
+        tp3_pct=tp3_pct,
+        leverage=leverage,
+        reasons=reasons,
+        news_sentiment=news_sentiment,
+    )
