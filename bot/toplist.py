@@ -1,6 +1,6 @@
 """
-Fetches the top N cryptocurrencies by market cap from CoinGecko.
-Falls back to a hardcoded top 300 list if CoinGecko is unavailable.
+Fetches the top 200 cryptocurrencies by market cap from CoinGecko.
+Falls back to a hardcoded list if CoinGecko is unavailable.
 Cache persists for 4 hours to avoid rate limits.
 """
 
@@ -22,10 +22,10 @@ FALLBACK_TOP_SYMBOLS = {
     "TAO", "SUI", "RENDER", "INJ", "GRT", "FTM", "SAND", "MANA", "AXS",
     "THETA", "XTZ", "EGLD", "FLOW", "KAVA", "NEO", "CHZ", "CRV", "ZEC",
     "COMP", "YFI", "SNX", "1INCH", "RUNE", "LDO", "CAKE", "DYDX", "ENJ",
-    "BAT", "ZRX", "OCEAN", "BAND", "KNC", "REN", "NMR", "SUSHI", "UMA",
-    "CELO", "SKL", "STORJ", "ANKR", "CTSI", "OGN", "PERP", "RARI", "SLP",
-    "JASMY", "GALA", "ENS", "APE", "GMT", "LUNC", "HNT", "ROSE", "ONE",
-    "ZIL", "IOTA", "HOT", "SC", "BTT", "WIN", "FLOKI", "PEPE", "WIF",
+    "BAT", "ZRX", "OCEAN", "BAND", "KNC", "NMR", "SUSHI", "UMA",
+    "CELO", "SKL", "STORJ", "ANKR", "CTSI", "PERP", "SLP",
+    "JASMY", "GALA", "ENS", "APE", "GMT", "HNT", "ROSE", "ONE",
+    "ZIL", "IOTA", "HOT", "BTT", "WIN", "FLOKI", "PEPE", "WIF",
     # Top 200
     "BONK", "JTO", "PYTH", "JUP", "STRK", "TIA", "HYPE", "WLD",
     "PENDLE", "BLUR", "CFX", "MANTA", "ALT", "PIXEL", "PORTAL",
@@ -36,26 +36,19 @@ FALLBACK_TOP_SYMBOLS = {
     "FWOG", "MICHI", "KEYCAT", "SUNDOG", "LAUNCHCOIN", "VINE",
     "FARTCOIN", "ZEREBRO", "VIRTUAL", "AIXBT", "MORPHO", "USUAL",
     "RESOLV", "DEEP", "WAL", "ANIME", "FORM", "IP", "PARTI",
-    "TST", "KAITO", "SHELL", "MOVE", "COOKIE", "SKYAI", "GRIFFAIN",
-    # Top 300
-    "OM", "RENDER", "FET", "AGIX", "OCEAN", "RNDR", "AKT", "NMR",
-    "GNO", "RPL", "LPT", "API3", "BAND", "TRB", "UMA", "DIA",
-    "VELO", "HOOK", "LOKA", "CHESS", "UNFI", "BIFI", "DUSK",
+    "TST", "KAITO", "SHELL", "MOVE", "COOKIE", "SKYAI",
+    "OM", "FET", "AGIX", "AKT", "GNO", "RPL", "LPT",
+    "API3", "TRB", "DIA", "HOOK", "LOKA", "CHESS", "UNFI",
     "QUICK", "NULS", "MTL", "POLS", "POND", "HARD", "STMX",
-    "WAN", "FIO", "COS", "ARPA", "CTXC", "COCOS", "FOR", "AKRO",
-    "BEL", "WING", "SWAP", "SFP", "BURGER", "MDT", "PROM", "FRONT",
-    "SUSD", "MBL", "FIRO", "SYS", "VIB", "TCT", "VITE", "TROY",
-    "PERL", "OAX", "IDEX", "DOCK", "PHB", "BTS", "KEY", "AION",
-    "STORM", "PPT", "MITH", "EVX", "QSP", "FUEL", "CDT", "DNT",
-    "AMB", "ARN", "SNGLS", "CHAT", "AST", "LEND", "YOYO", "SNM",
-    "VEN", "MOD", "IOST", "SKY", "LOOM", "DENT", "RCN", "APPC",
-    "OST", "INS", "QLC", "STRAT", "BCPT", "POWR", "MCO", "GTO",
-    "GVT", "TNT", "BRD", "ICX", "WTC", "FUN", "POA", "REQ",
-    "XVGC", "XVS", "ALPHA", "AUTO", "BAKE", "BELT", "BUNNY",
-    "EPS", "RABBIT", "TWT", "XNO", "EGLD", "HBAR", "KAVA", "LUNA",
-    "MINA", "SCRT", "MOVR", "ACA", "KSM", "ASTR", "SDN", "PHA",
-    "TEER", "LIT", "GLMR", "PARA", "CSM", "KAR", "BNC", "AUSD",
-    "VDOT", "VSKSM", "KBTC", "KINT", "AIR", "HKO", "CRAB", "AMAS",
+    "WAN", "ARPA", "CTXC", "FOR", "AKRO", "BEL", "SFP",
+    "MDT", "PROM", "FRONT", "MBL", "FIRO", "SYS", "VIB",
+    "TROY", "PERL", "IDEX", "DOCK", "PHB", "BTS", "KEY",
+    "XVS", "ALPHA", "AUTO", "BAKE", "BELT", "TWT", "XNO",
+    "MINA", "SCRT", "MOVR", "ACA", "KSM", "ASTR", "PHA",
+    "GLMR", "KAR", "WIF", "POPCAT", "ETHFI", "PAXG",
+    "OKB", "KCS", "HT", "CRO", "FTT", "BNX", "LEVER",
+    "SPX", "PI", "KAS", "NOT", "DOGS", "HMSTR",
+    "ZRO", "IO", "LISTA", "TAIKO", "ZK", "SAGA",
 }
 
 
@@ -74,7 +67,7 @@ def get_top_symbols(limit: int = 200) -> set[str]:
         if _cache is not None:
             logger.warning("[toplist] fetch failed — using stale cache")
             return _cache[1]
-        logger.warning("[toplist] fetch failed — using hardcoded fallback list")
+        logger.warning("[toplist] fetch failed — using hardcoded fallback")
         return FALLBACK_TOP_SYMBOLS
 
     _cache = (time.time(), symbols)
