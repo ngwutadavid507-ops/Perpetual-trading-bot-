@@ -1,6 +1,7 @@
 """
 Upstash Redis client using REST API with POST requests.
 Handles complex JSON values safely.
+All bot state lives here — survives Railway restarts.
 """
 
 import logging
@@ -40,6 +41,7 @@ def _post(command: list) -> dict:
 
 
 def redis_set(key: str, value: str, ex: int = None) -> bool:
+    """Set a key with optional expiry in seconds."""
     if ex:
         result = _post(["SET", key, value, "EX", ex])
     else:
@@ -48,42 +50,47 @@ def redis_set(key: str, value: str, ex: int = None) -> bool:
 
 
 def redis_get(key: str) -> str | None:
+    """Get a key value or None if not exists."""
     result = _post(["GET", key])
     return result.get("result")
 
 
 def redis_delete(key: str) -> bool:
+    """Delete a key."""
     result = _post(["DEL", key])
     return bool(result.get("result"))
 
 
 def redis_incr(key: str) -> int | None:
+    """Increment a counter and return new value."""
     result = _post(["INCR", key])
     return result.get("result")
 
 
 def redis_expire(key: str, seconds: int) -> bool:
+    """Set expiry on existing key."""
     result = _post(["EXPIRE", key, seconds])
     return bool(result.get("result"))
 
 
 def redis_hset(key: str, field: str, value: str) -> bool:
+    """Set a hash field."""
     result = _post(["HSET", key, field, value])
     return result.get("result") is not None
 
 
 def redis_hget(key: str, field: str) -> str | None:
+    """Get a hash field."""
     result = _post(["HGET", key, field])
     return result.get("result")
 
 
 def redis_hgetall(key: str) -> dict:
+    """Get all hash fields and values."""
     result = _post(["HGETALL", key])
     raw = result.get("result", [])
     if not raw or not isinstance(raw, list):
         return {}
-    # Upstash returns flat list [field, value, field, value...]
-    # Only keep clean symbol-like field names, skip JSON fragments
     pairs = {}
     it = iter(raw)
     for field in it:
@@ -97,6 +104,7 @@ def redis_hgetall(key: str) -> dict:
 
 
 def redis_hdel(key: str, field: str) -> bool:
+    """Delete a hash field."""
     result = _post(["HDEL", key, field])
     return bool(result.get("result"))
 
@@ -107,7 +115,7 @@ def redis_keys(pattern: str) -> list[str]:
     return result.get("result", [])
 
 
-def redis_flushall() -> bool:
+def redis_flushdb() -> bool:
     """Flush all keys — use carefully."""
     result = _post(["FLUSHDB"])
     return result.get("result") == "OK"
