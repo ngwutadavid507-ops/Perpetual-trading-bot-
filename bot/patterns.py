@@ -1,42 +1,46 @@
 """
-Candlestick pattern detection on the most recently CLOSED candle.
-Implements the patterns covered in the lesson: engulfing, pin bar, doji.
-Each function returns "bullish", "bearish", or None.
+Candlestick pattern detection.
+Detects both reversal and continuation patterns.
+Each function returns 'bullish', 'bearish', or None.
 """
 
 import pandas as pd
 
 
-def _body(row):
+def _body(row) -> float:
     return abs(row["close"] - row["open"])
 
 
-def _range(row):
+def _range(row) -> float:
     return row["high"] - row["low"]
 
+
+def _upper_wick(row) -> float:
+    return row["high"] - max(row["close"], row["open"])
+
+
+def _lower_wick(row) -> float:
+    return min(row["close"], row["open"]) - row["low"]
+
+
+# ─── Reversal Patterns ────────────────────────────────────────────────────────
 
 def detect_engulfing(df: pd.DataFrame) -> str | None:
     if len(df) < 2:
         return None
     prev, curr = df.iloc[-2], df.iloc[-1]
-
     prev_bullish = prev["close"] > prev["open"]
     curr_bullish = curr["close"] > curr["open"]
-
-    # Bearish engulfing: green candle followed by a red candle that engulfs its body
     if prev_bullish and not curr_bullish:
         if curr["open"] >= prev["close"] and curr["close"] <= prev["open"]:
             return "bearish"
-
-    # Bullish engulfing: red candle followed by a green candle that engulfs its body
     if not prev_bullish and curr_bullish:
         if curr["open"] <= prev["close"] and curr["close"] >= prev["open"]:
             return "bullish"
-
     return None
 
 
-def detect_pin_bar(df: pd.DataFrame, wick_to_body_ratio: float = 2.0) -> str | None:
+def detect_pin_bar(df: pd.DataFrame, wick_ratio: float = 2.0) -> str | None:
     if len(df) < 1:
         return None
     row = df.iloc[-1]
@@ -44,26 +48,93 @@ def detect_pin_bar(df: pd.DataFrame, wick_to_body_ratio: float = 2.0) -> str | N
     full_range = _range(row)
     if full_range == 0 or body == 0:
         return None
-
-    upper_wick = row["high"] - max(row["close"], row["open"])
-    lower_wick = min(row["close"], row["open"]) - row["low"]
-
-    # Bearish pin bar: long upper wick, small body near the low
-    if upper_wick >= body * wick_to_body_ratio and upper_wick > lower_wick:
+    upper = _upper_wick(row)
+    lower = _lower_wick(row)
+    if upper >= body * wick_ratio and upper > lower * 2:
         return "bearish"
-
-    # Bullish pin bar: long lower wick, small body near the high
-    if lower_wick >= body * wick_to_body_ratio and lower_wick > upper_wick:
+    if lower >= body * wick_ratio and lower > upper * 2:
         return "bullish"
-
     return None
 
 
-def detect_doji(df: pd.DataFrame, body_to_range_max: float = 0.1) -> bool:
+def detect_doji(df: pd.DataFrame, body_ratio: float = 0.1) -> bool:
     if len(df) < 1:
         return False
     row = df.iloc[-1]
     full_range = _range(row)
     if full_range == 0:
         return False
-    return (_body(row) / full_range) <= body_to_range_max
+    return (_body(row) / full_range) <= body_ratio
+
+
+def detect_rsi_divergence(df: pd.DataFrame, lookback: int = 20) -> str | None:
+    if len(df) < lookback or "rsi" not in df.columns:
+        return None
+    window = df.tail(lookback).reset_index(drop=True)
+    prices = window["close"]
+    rsi = window["rsi"]
+    if rsi.isnull().any():
+        return None
+    swing_lows = [
+        i for i in range(2, len(window) - 2)
+        if window["low"].iloc[i] == window["low"].iloc[i - 2:i + 3].min()
+    ]
+    if len(swing_lows) >= 2:
+        i1, i2 = swing_lows[-2], swing_lows[-1]
+        if prices.iloc[i2] < prices.iloc[i1] and rsi.iloc[i2] > rsi.iloc[i1]:
+            return "bullish"
+    swing_highs = [
+        i for i in range(2, len(window) - 2)
+        if window["high"].iloc[i] == window["high"].iloc[i - 2:i + 3].max()
+    ]
+    if len(swing_highs) >= 2:
+        i1, i2 = swing_highs[-2], swing_highs[-1]
+        if prices.iloc[i2] > prices.iloc[i1] and rsi.iloc[i2] < rsi.iloc[i1]:
+            return "bearish"
+    return None
+
+
+# ─── Continuation Patterns ────────────────────────────────────────────────────
+
+def detect_pullback_rejection(df: pd.DataFrame, direction: str) -> bool:
+    """
+    Detects a weak pullback rejection candle in a trending market.
+    For longs: small candle near support with lower wick showing buyers.
+    For shorts: small candle near resistance with upper wick showing sellers.
+    """
+    if len(df) < 1:
+        return False
+    row = df.iloc[-1]
+    body = _body(row)
+    full_range = _range(row)
+    if full_range == 0:
+        return False
+    upper = _upper_wick(row)
+    lower = _lower_wick(row)
+    body_ratio = body / full_range
+    if direction == "long":
+        return body_ratio <= 0.5 and lower >= body * 1.2
+    if direction == "short":
+        return body_ratio <= 0.5 and upper >= body * 1.2
+    return False
+
+
+def detect_momentum_candle(df: pd.DataFrame, direction: str) -> bool:
+    """
+    Strong momentum candle in trend direction.
+    Body must be at least 60% of the full candle range.
+    """
+    if len(df) < 1:
+        return False
+    row = df.iloc[-1]
+    body = _body(row)
+    full_range = _range(row)
+    if full_range == 0:
+        return False
+    is_bullish = row["close"] > row["open"]
+    body_ratio = body / full_range
+    if direction == "long" and is_bullish and body_ratio >= 0.6:
+        return True
+    if direction == "short" and not is_bullish and body_ratio >= 0.6:
+        return True
+    return False
