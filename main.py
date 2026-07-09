@@ -1,12 +1,17 @@
 """
-Main scanner with:
-- Single exchange signals fire if confidence >= 65%
-- Cross-exchange confirmation boosts confidence by 10%
+Phoenix Signal Bot V2 — Main Entry Point
+
+Features:
+- Dual strategy: trend continuation + reversal
+- Live price validation before signal fires
+- News sentiment filter via RSS feeds
+- Cross-exchange confirmation (OKX + BingX must agree)
+- Single exchange accepted at 75%+ confidence
+- Signal lifecycle tracking with grades
 - Reversal alerts for opposing signals on active trades
-- AI filter selects best 1-2 signals per cycle
-- Daily limit: max 15 signals per day (Redis backed)
-- Active trade protection per symbol
-- Daily summary sent once at midnight UTC (Redis dedup)
+- Daily limit: 15 signals max
+- Daily summary at midnight UTC
+- All state persisted in Redis
 """
 
 import asyncio
@@ -15,11 +20,15 @@ from collections import defaultdict
 from datetime import datetime, timezone
 
 from config.settings import Config
-from bot.exchanges import build_exchange, get_liquid_perp_symbols, fetch_dual_timeframe
+from bot.exchanges import (
+    build_exchange,
+    get_liquid_perp_symbols,
+    fetch_dual_timeframe,
+    fetch_live_price,
+)
 from bot.signal_engine import build_signal, Signal
-from bot.notifier import send_signal
-from bot.tracker import SignalTracker
-from bot.ai_filter import ai_select_signals, get_daily_count, remaining_today, MAX_SIGNALS_PER_DAY
+from bot.lifecycle import LifecycleTracker, SignalLifecycle, SignalState
+from bot.notifier import send_signal, send_result, send_reversal_alert
 from bot.summary import record_signal_sent, record_result, format_daily_summary
 from bot.redis_client import redis_get, redis_set
 
@@ -29,12 +38,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("scanner")
 
-tracker = SignalTracker()
+lifecycle = LifecycleTracker()
 _exchange_cache: dict = {}
-
-
-def required_confidence(symbol: str) -> float:
-    return Config.MIN_CONFIDENCE_DEFAULT
 
 
 def get_current_price(symbol: str, exchange: str) -> float | None:
@@ -43,15 +48,11 @@ def get_current_price(symbol: str, exchange: str) -> float | None:
         if not ex:
             for ex_obj in _exchange_cache.values():
                 try:
-                    ticker = ex_obj.fetch_ticker(symbol)
-                    price = ticker.get("last")
-                    if price:
-                        return price
+                    return fetch_live_price(ex_obj, symbol)
                 except Exception:
                     continue
         else:
-            ticker = ex.fetch_ticker(symbol)
-            return ticker.get("last")
+            return fetch_live_price(ex, symbol)
     except Exception as e:
         logger.debug(f"Price check failed for {symbol}: {e}")
     return None
@@ -59,6 +60,24 @@ def get_current_price(symbol: str, exchange: str) -> float | None:
 
 def get_base_symbol(symbol: str) -> str:
     return symbol.split("/")[0]
+
+
+def get_daily_count() -> int:
+    key = f"daily_count:v2:{datetime.now(timezone.utc).date()}"
+    val = redis_get(key)
+    return int(val) if val else 0
+
+
+def increment_daily_count():
+    from bot.redis_client import redis_incr, redis_expire
+    key = f"daily_count:v2:{datetime.now(timezone.utc).date()}"
+    count = redis_incr(key)
+    if count == 1:
+        redis_expire(key, 48 * 3600)
+
+
+def remaining_today() -> int:
+    return max(0, Config.MAX_SIGNALS_PER_DAY - get_daily_count())
 
 
 async def send_daily_summary():
@@ -74,18 +93,15 @@ async def send_daily_summary():
         )
         logger.info("Daily summary sent")
     except Exception as e:
-        logger.error(f"Failed to send daily summary: {e}")
+        logger.error(f"Daily summary failed: {e}")
 
 
 async def check_and_send_summary():
-    """Sends summary at midnight UTC — Redis deduplication prevents doubles."""
     now = datetime.now(timezone.utc)
     today = str(now.date())
-
     if now.hour == 0 and now.minute < 10:
-        sent_key = f"summary_sent:{today}"
-        already_sent = redis_get(sent_key)
-        if not already_sent:
+        sent_key = f"summary_sent:v2:{today}"
+        if not redis_get(sent_key):
             redis_set(sent_key, "1", ex=86400)
             await send_daily_summary()
 
@@ -93,45 +109,51 @@ async def check_and_send_summary():
 async def scan_all_exchanges():
     daily_remaining = remaining_today()
     if daily_remaining <= 0:
-        logger.info(f"Daily limit reached ({MAX_SIGNALS_PER_DAY}) — skipping scan")
+        logger.info(
+            f"Daily limit reached "
+            f"({Config.MAX_SIGNALS_PER_DAY}) — skipping scan"
+        )
         return
 
+    # {base_symbol: {exchange_id: (Signal, df_5m, live_price)}}
     exchange_signals: dict[str, dict[str, tuple]] = defaultdict(dict)
 
     for exchange_id in Config.EXCHANGES:
         exchange = build_exchange(exchange_id)
         _exchange_cache[exchange_id] = exchange
 
-        symbols = get_liquid_perp_symbols(exchange, Config.MIN_24H_VOLUME_USDT)
+        symbols = get_liquid_perp_symbols(
+            exchange, Config.MIN_24H_VOLUME_USDT
+        )
         logger.info(f"[{exchange_id}] scanning {len(symbols)} liquid symbols")
 
         skipped = 0
         for symbol in symbols:
             try:
-                df_1h, df_15m = fetch_dual_timeframe(exchange, symbol)
-                if df_1h is None or df_15m is None:
+                df_1h, df_5m = fetch_dual_timeframe(exchange, symbol)
+                if df_1h is None or df_5m is None:
                     skipped += 1
                     continue
+
+                # Fetch live price for validation
+                live_price = fetch_live_price(exchange, symbol)
 
                 sig = build_signal(
                     symbol,
                     exchange_id,
                     df_1h,
-                    df_15m,
-                    Config.MIN_RISK_REWARD,
-                    Config.SIGNAL_COOLDOWN_MINUTES,
+                    df_5m,
+                    live_price=live_price,
                 )
                 if sig is None:
                     continue
 
-                if sig.confidence < required_confidence(symbol):
-                    continue
-
                 base = get_base_symbol(symbol)
-                exchange_signals[base][exchange_id] = (sig, df_15m)
+                exchange_signals[base][exchange_id] = (sig, df_5m, live_price)
                 logger.info(
                     f"[{exchange_id}] candidate: {base} "
-                    f"{sig.direction} conf={sig.confidence}"
+                    f"{sig.direction} {sig.strategy_type} "
+                    f"conf={sig.confidence}"
                 )
 
             except Exception as e:
@@ -142,16 +164,18 @@ async def scan_all_exchanges():
 
     num_exchanges = len(Config.EXCHANGES)
     confirmed_signals: list[tuple] = []
-    reversal_signals: list[tuple] = []
+    reversal_candidates: list[tuple] = []
 
     for base, ex_sigs in exchange_signals.items():
 
-        directions = [sig.direction for sig, _ in ex_sigs.values()]
+        # Check direction agreement
+        directions = [sig.direction for sig, _, _ in ex_sigs.values()]
         if len(set(directions)) > 1:
             logger.debug(f"{base}: exchanges disagree — skipped")
             continue
 
-        best_sig, best_df = max(
+        # Pick highest confidence signal
+        best_sig, best_df, best_price = max(
             ex_sigs.values(),
             key=lambda x: x[0].confidence
         )
@@ -159,89 +183,151 @@ async def scan_all_exchanges():
         num_agreeing = len(ex_sigs)
 
         if num_agreeing == num_exchanges:
-            best_sig.confidence = min(100.0, round(best_sig.confidence * 1.1, 1))
+            # All exchanges agree — boost confidence 10%
+            best_sig.confidence = min(
+                100.0, round(best_sig.confidence * 1.1, 1)
+            )
             best_sig.exchange = "confirmed"
             logger.info(
                 f"{base}: cross-exchange confirmed — "
-                f"confidence boosted to {best_sig.confidence}%"
+                f"conf boosted to {best_sig.confidence}%"
             )
-        elif best_sig.confidence >= 65:
+        elif best_sig.confidence >= Config.SINGLE_EXCHANGE_MIN_CONFIDENCE:
             best_sig.exchange = "confirmed"
             logger.info(
-                f"{base}: single exchange conf={best_sig.confidence} — accepted"
+                f"{base}: single exchange "
+                f"conf={best_sig.confidence} — accepted"
             )
         else:
             logger.debug(
-                f"{base}: single exchange conf={best_sig.confidence} "
-                f"< 65 — skipped"
+                f"{base}: single exchange "
+                f"conf={best_sig.confidence} < "
+                f"{Config.SINGLE_EXCHANGE_MIN_CONFIDENCE} — skipped"
             )
             continue
 
+        # Check if symbol has an active trade
         full_symbol = best_sig.symbol
-        if tracker.is_symbol_active(full_symbol):
-            active = tracker.get_active_trade(full_symbol)
-            if active and active.signal.direction != best_sig.direction:
+        active_direction = lifecycle.get_active_direction(full_symbol)
+
+        if active_direction is not None:
+            if active_direction != best_sig.direction:
+                # Opposing signal — check for reversal
                 if best_sig.confidence >= 80:
-                    reversal_signals.append((best_sig, best_df))
+                    reversal_candidates.append(
+                        (best_sig, best_df, best_price)
+                    )
                     logger.info(
                         f"Reversal candidate: {base} "
-                        f"{active.signal.direction} → {best_sig.direction} "
+                        f"{active_direction} → {best_sig.direction} "
                         f"conf={best_sig.confidence}"
                     )
                 else:
                     logger.info(
-                        f"{base}: opposing conf={best_sig.confidence} "
+                        f"{base}: opposing signal "
+                        f"conf={best_sig.confidence} "
                         f"too low for reversal — ignored"
                     )
             else:
-                logger.info(f"{base}: same direction already active — skipped")
+                logger.info(
+                    f"{base}: same direction already active — skipped"
+                )
             continue
 
-        confirmed_signals.append((best_sig, best_df))
+        confirmed_signals.append((best_sig, best_df, best_price))
 
     logger.info(
         f"Confirmed: {len(confirmed_signals)} | "
-        f"Reversals: {len(reversal_signals)} | "
-        f"Daily: {get_daily_count()}/{MAX_SIGNALS_PER_DAY}"
+        f"Reversals: {len(reversal_candidates)} | "
+        f"Daily: {get_daily_count()}/{Config.MAX_SIGNALS_PER_DAY}"
     )
 
-    # Send reversal alerts first
-    for sig, df_15m in reversal_signals:
-        active_tracked = tracker.get_active_trade(sig.symbol)
-        if active_tracked:
-            was_sent = await tracker.handle_reversal(
-                sig,
+    # Send reversal alerts first — urgent
+    for sig, df_5m, live_price in reversal_candidates:
+        active_lc = lifecycle.load(sig.symbol)
+        if active_lc:
+            await send_reversal_alert(
                 Config.TELEGRAM_BOT_TOKEN,
                 Config.TELEGRAM_CHAT_ID,
+                active_symbol=sig.symbol,
+                active_direction=active_lc.direction,
+                new_sig=sig,
+                df=df_5m,
             )
-            if was_sent:
-                await asyncio.sleep(4)
-
-    # AI filter selects best signals
-    if confirmed_signals:
-        selected = ai_select_signals(confirmed_signals)
-        for sig, df_15m in selected:
-            await send_signal(
-                Config.TELEGRAM_BOT_TOKEN,
-                Config.TELEGRAM_CHAT_ID,
-                sig,
-                df=df_15m,
-            )
-            tracker.add(sig)
-            record_signal_sent(sig.symbol, sig.direction, sig.confidence)
-            logger.info(
-                f"SIGNAL SENT: {sig.symbol} {sig.direction} "
-                f"conf={sig.confidence} | "
-                f"Daily: {get_daily_count()}/{MAX_SIGNALS_PER_DAY}"
-            )
+            lifecycle.delete(sig.symbol)
             await asyncio.sleep(4)
+
+    # Sort confirmed by confidence — best first
+    confirmed_signals.sort(
+        key=lambda x: x[0].confidence, reverse=True
+    )
+
+    # Send top signals up to per-scan and daily limits
+    signals_sent_this_scan = 0
+    for sig, df_5m, live_price in confirmed_signals:
+        if signals_sent_this_scan >= Config.MAX_SIGNALS_PER_SCAN:
+            break
+        if remaining_today() <= 0:
+            break
+
+        # Final live price check before sending
+        current_price = live_price or get_current_price(
+            sig.symbol, sig.exchange
+        )
+
+        await send_signal(
+            Config.TELEGRAM_BOT_TOKEN,
+            Config.TELEGRAM_CHAT_ID,
+            sig,
+            df=df_5m,
+        )
+
+        # Create lifecycle entry
+        lc = SignalLifecycle(
+            symbol=sig.symbol,
+            direction=sig.direction,
+            strategy_type=sig.strategy_type,
+            confidence=sig.confidence,
+            entry=sig.entry,
+            live_entry=current_price or sig.entry,
+            stop_loss=sig.stop_loss,
+            take_profit1=sig.take_profit1,
+            take_profit2=sig.take_profit2,
+            take_profit3=sig.take_profit3,
+            leverage=sig.leverage,
+            sl_pct=sig.sl_pct,
+            tp1_pct=sig.tp1_pct,
+            tp2_pct=sig.tp2_pct,
+            tp3_pct=sig.tp3_pct,
+            exchange=sig.exchange,
+        )
+        lifecycle.save(lc)
+        lifecycle.mark_sent(sig.symbol, current_price or sig.entry)
+
+        record_signal_sent(
+            sig.symbol,
+            sig.direction,
+            sig.confidence,
+            sig.strategy_type,
+            sig.leverage,
+        )
+
+        increment_daily_count()
+        signals_sent_this_scan += 1
+
+        logger.info(
+            f"SIGNAL SENT: {sig.symbol} {sig.direction} "
+            f"{sig.strategy_type} conf={sig.confidence} | "
+            f"Daily: {get_daily_count()}/{Config.MAX_SIGNALS_PER_DAY}"
+        )
+        await asyncio.sleep(4)
 
 
 async def run_once():
     Config.validate()
     await check_and_send_summary()
     await scan_all_exchanges()
-    await tracker.check_all(
+    await lifecycle.check_all(
         get_current_price,
         Config.TELEGRAM_BOT_TOKEN,
         Config.TELEGRAM_CHAT_ID,
@@ -254,7 +340,9 @@ async def run_forever():
             await run_once()
         except Exception as e:
             logger.exception(f"Scan cycle failed: {e}")
-        logger.info(f"Sleeping {Config.SCAN_INTERVAL_SECONDS}s until next scan")
+        logger.info(
+            f"Sleeping {Config.SCAN_INTERVAL_SECONDS}s until next scan"
+        )
         await asyncio.sleep(Config.SCAN_INTERVAL_SECONDS)
 
 
