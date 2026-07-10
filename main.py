@@ -1,17 +1,11 @@
 """
 Phoenix Signal Bot V2 — Main Entry Point
 
-Features:
-- Dual strategy: trend continuation + reversal
-- Live price validation before signal fires
-- News sentiment filter via RSS feeds
-- Cross-exchange confirmation (OKX + BingX must agree)
-- Single exchange accepted at 75%+ confidence
-- Signal lifecycle tracking with grades
-- Reversal alerts for opposing signals on active trades
-- Daily limit: 15 signals max
-- Daily summary at midnight UTC
-- All state persisted in Redis
+Key improvements in this version:
+- Signal spacing: minimum 45 minutes between consecutive signals
+- SL calculated from live entry price (fixes -2.74R anomaly)
+- Signals sorted by confidence — best signal fires first
+- After each signal bot waits 45 min before next regardless of scan
 """
 
 import asyncio
@@ -26,9 +20,14 @@ from bot.exchanges import (
     fetch_dual_timeframe,
     fetch_live_price,
 )
-from bot.signal_engine import build_signal, Signal
+from bot.signal_engine import (
+    build_signal,
+    Signal,
+    check_signal_spacing,
+    record_signal_sent_time,
+)
 from bot.lifecycle import LifecycleTracker, SignalLifecycle, SignalState
-from bot.notifier import send_signal, send_result, send_reversal_alert
+from bot.notifier import send_signal, send_reversal_alert
 from bot.summary import record_signal_sent, record_result, format_daily_summary
 from bot.redis_client import redis_get, redis_set
 
@@ -48,7 +47,9 @@ def get_current_price(symbol: str, exchange: str) -> float | None:
         if not ex:
             for ex_obj in _exchange_cache.values():
                 try:
-                    return fetch_live_price(ex_obj, symbol)
+                    price = fetch_live_price(ex_obj, symbol)
+                    if price:
+                        return price
                 except Exception:
                     continue
         else:
@@ -115,6 +116,14 @@ async def scan_all_exchanges():
         )
         return
 
+    # Check signal spacing — don't send if too soon after last signal
+    if not check_signal_spacing():
+        logger.info(
+            "Signal spacing enforced — "
+            "waiting 45 min since last signal"
+        )
+        return
+
     # {base_symbol: {exchange_id: (Signal, df_5m, live_price)}}
     exchange_signals: dict[str, dict[str, tuple]] = defaultdict(dict)
 
@@ -135,7 +144,6 @@ async def scan_all_exchanges():
                     skipped += 1
                     continue
 
-                # Fetch live price for validation
                 live_price = fetch_live_price(exchange, symbol)
 
                 sig = build_signal(
@@ -168,13 +176,11 @@ async def scan_all_exchanges():
 
     for base, ex_sigs in exchange_signals.items():
 
-        # Check direction agreement
         directions = [sig.direction for sig, _, _ in ex_sigs.values()]
         if len(set(directions)) > 1:
             logger.debug(f"{base}: exchanges disagree — skipped")
             continue
 
-        # Pick highest confidence signal
         best_sig, best_df, best_price = max(
             ex_sigs.values(),
             key=lambda x: x[0].confidence
@@ -183,7 +189,6 @@ async def scan_all_exchanges():
         num_agreeing = len(ex_sigs)
 
         if num_agreeing == num_exchanges:
-            # All exchanges agree — boost confidence 10%
             best_sig.confidence = min(
                 100.0, round(best_sig.confidence * 1.1, 1)
             )
@@ -200,38 +205,32 @@ async def scan_all_exchanges():
             )
         else:
             logger.debug(
-                f"{base}: single exchange "
-                f"conf={best_sig.confidence} < "
-                f"{Config.SINGLE_EXCHANGE_MIN_CONFIDENCE} — skipped"
+                f"{base}: conf={best_sig.confidence} "
+                f"< {Config.SINGLE_EXCHANGE_MIN_CONFIDENCE} — skipped"
             )
             continue
 
-        # Check if symbol has an active trade
         full_symbol = best_sig.symbol
         active_direction = lifecycle.get_active_direction(full_symbol)
 
         if active_direction is not None:
             if active_direction != best_sig.direction:
-                # Opposing signal — check for reversal
                 if best_sig.confidence >= 80:
                     reversal_candidates.append(
                         (best_sig, best_df, best_price)
                     )
                     logger.info(
-                        f"Reversal candidate: {base} "
+                        f"Reversal: {base} "
                         f"{active_direction} → {best_sig.direction} "
                         f"conf={best_sig.confidence}"
                     )
                 else:
                     logger.info(
-                        f"{base}: opposing signal "
-                        f"conf={best_sig.confidence} "
-                        f"too low for reversal — ignored"
+                        f"{base}: opposing conf={best_sig.confidence} "
+                        f"too low — ignored"
                     )
             else:
-                logger.info(
-                    f"{base}: same direction already active — skipped"
-                )
+                logger.info(f"{base}: same direction active — skipped")
             continue
 
         confirmed_signals.append((best_sig, best_df, best_price))
@@ -242,7 +241,7 @@ async def scan_all_exchanges():
         f"Daily: {get_daily_count()}/{Config.MAX_SIGNALS_PER_DAY}"
     )
 
-    # Send reversal alerts first — urgent
+    # Send reversal alerts first
     for sig, df_5m, live_price in reversal_candidates:
         active_lc = lifecycle.load(sig.symbol)
         if active_lc:
@@ -257,20 +256,22 @@ async def scan_all_exchanges():
             lifecycle.delete(sig.symbol)
             await asyncio.sleep(4)
 
-    # Sort confirmed by confidence — best first
+    # Sort by confidence — best signal first
     confirmed_signals.sort(
         key=lambda x: x[0].confidence, reverse=True
     )
 
-    # Send top signals up to per-scan and daily limits
-    signals_sent_this_scan = 0
+    # Send ONLY the single best signal this scan cycle
+    # Bot enforces 45 min gap before next signal via Redis
     for sig, df_5m, live_price in confirmed_signals:
-        if signals_sent_this_scan >= Config.MAX_SIGNALS_PER_SCAN:
-            break
         if remaining_today() <= 0:
             break
 
-        # Final live price check before sending
+        # Re-check spacing — another scan might have sent in parallel
+        if not check_signal_spacing():
+            logger.info("Signal spacing: skipping — too soon after last")
+            break
+
         current_price = live_price or get_current_price(
             sig.symbol, sig.exchange
         )
@@ -282,7 +283,9 @@ async def scan_all_exchanges():
             df=df_5m,
         )
 
-        # Create lifecycle entry
+        # Record signal sent time — enforces 45 min gap
+        record_signal_sent_time()
+
         lc = SignalLifecycle(
             symbol=sig.symbol,
             direction=sig.direction,
@@ -313,14 +316,16 @@ async def scan_all_exchanges():
         )
 
         increment_daily_count()
-        signals_sent_this_scan += 1
 
         logger.info(
             f"SIGNAL SENT: {sig.symbol} {sig.direction} "
             f"{sig.strategy_type} conf={sig.confidence} | "
-            f"Daily: {get_daily_count()}/{Config.MAX_SIGNALS_PER_DAY}"
+            f"Daily: {get_daily_count()}/{Config.MAX_SIGNALS_PER_DAY} | "
+            f"Next signal in 45 min"
         )
-        await asyncio.sleep(4)
+
+        # Only send ONE signal per scan — spacing handles the rest
+        break
 
 
 async def run_once():
