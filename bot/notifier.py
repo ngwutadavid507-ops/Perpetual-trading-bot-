@@ -18,6 +18,7 @@ def format_signal_message(sig: Signal) -> str:
     arrow = "🟢 LONG" if sig.direction == "long" else "🔴 SHORT"
     symbol_clean = sig.symbol.replace(":USDT", "").replace("/USDT", "")
     strategy_label = "📈 CONTINUATION" if sig.strategy_type == "continuation" else "🔄 REVERSAL"
+    obs_label = " ✅ OBSERVED" if sig.observation_confirmed else " ⚡ IMMEDIATE"
 
     if sig.direction == "long":
         sl_label = f"`{sig.stop_loss}` (-{sig.sl_pct}%)"
