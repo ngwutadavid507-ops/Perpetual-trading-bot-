@@ -49,7 +49,7 @@ def format_signal_message(sig: Signal) -> str:
 
     return (
         f"*{arrow} — {symbol_clean}*\n"
-        f"{strategy_label} | Confidence: *{sig.confidence}%* | Leverage: *{sig.leverage}x*\n"
+        f"{strategy_label}{obs_label} | Confidence: *{sig.confidence}%* | Leverage: *{sig.leverage}x*\n"
         f"{news_icon}\n"
         f"Entry:  `{sig.entry}`\n"
         f"SL:     {sl_label}\n\n"
