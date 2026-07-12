@@ -258,8 +258,9 @@ def build_signal(
     )
 
     if not setup:
-        # No setup found — if symbol was under observation, cancel it
-        cancel_observation(symbol)
+        # Only cancel observation if we have no setup at all
+        # Don't cancel just because score temporarily dropped
+        # The observation system handles expiry internally
         return None
 
     direction, confidence, reasons, strategy_type = setup
