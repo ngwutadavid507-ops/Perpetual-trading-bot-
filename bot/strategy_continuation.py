@@ -69,9 +69,9 @@ def _get_4h_trend(df_1h: pd.DataFrame) -> str:
         if not all([ema_8, ema_21, ema_50]):
             return "sideways"
 
-        if ema_8 > ema_21 > ema_50 and price > ema_8:
+        if ema_8 > ema_21 and price > ema_21:
             return "uptrend"
-        elif ema_8 < ema_21 < ema_50 and price < ema_8:
+        elif ema_8 < ema_21 and price < ema_21:
             return "downtrend"
         return "sideways"
     except Exception as e:
