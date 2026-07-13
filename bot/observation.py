@@ -3,10 +3,10 @@ Observation system — watches potential setups for 2 candle periods
 before firing a signal. Prevents entries on fake breakouts.
 
 Rules:
-- Confidence < 85%: observe for 2 x 5m candles (10 minutes)
-- Confidence >= 85%: fire immediately — too strong to wait
-- If setup breaks during observation: cancel silently
-- All three confirmations must still pass after observation period
+- Confidence < 85%: observe for 10 minutes (2 x 5m candles)
+- Confidence >= 85%: fire immediately
+- Cancel only if price moves >1% against setup direction during observation
+- Time expiry fires the signal if setup direction still holds
 """
 
 import json
@@ -19,8 +19,9 @@ from bot.redis_client import redis_get, redis_set, redis_delete
 logger = logging.getLogger(__name__)
 
 OBSERVATION_KEY = "observation:v2"
-OBSERVATION_MINUTES = 10  # 2 x 5m candles
+OBSERVATION_MINUTES = 10
 IMMEDIATE_FIRE_CONFIDENCE = 85.0
+MAX_ADVERSE_MOVE_PCT = 1.0
 
 
 @dataclass
@@ -30,6 +31,7 @@ class ObservedSetup:
     strategy_type: str
     confidence: float
     exchange_id: str
+    entry_price: float
     detected_at: datetime = field(default_factory=datetime.utcnow)
     checks_passed: int = 0
 
@@ -45,6 +47,7 @@ def _save(setup: ObservedSetup):
         "strategy_type": setup.strategy_type,
         "confidence": setup.confidence,
         "exchange_id": setup.exchange_id,
+        "entry_price": setup.entry_price,
         "detected_at": setup.detected_at.isoformat(),
         "checks_passed": setup.checks_passed,
     }
@@ -63,6 +66,7 @@ def _load(symbol: str) -> ObservedSetup | None:
             strategy_type=d["strategy_type"],
             confidence=float(d["confidence"]),
             exchange_id=d["exchange_id"],
+            entry_price=float(d.get("entry_price", 0)),
             detected_at=datetime.fromisoformat(d["detected_at"]),
             checks_passed=int(d.get("checks_passed", 0)),
         )
@@ -76,7 +80,6 @@ def _delete(symbol: str):
 
 
 def should_fire_immediately(confidence: float) -> bool:
-    """High confidence signals skip observation — fire right away."""
     return confidence >= IMMEDIATE_FIRE_CONFIDENCE
 
 
@@ -86,21 +89,16 @@ def start_observation(
     strategy_type: str,
     confidence: float,
     exchange_id: str,
+    entry_price: float,
 ) -> bool:
-    """
-    Starts watching a setup. Returns True if observation started,
-    False if already being observed in same direction.
-    """
     existing = _load(symbol)
     if existing:
         if existing.direction == direction:
             logger.debug(
-                f"[observation] {symbol} already under observation "
-                f"({existing.direction})"
+                f"[observation] {symbol} already watching {direction}"
             )
             return False
         else:
-            # Different direction — cancel old, start new
             _delete(symbol)
 
     setup = ObservedSetup(
@@ -109,70 +107,72 @@ def start_observation(
         strategy_type=strategy_type,
         confidence=confidence,
         exchange_id=exchange_id,
+        entry_price=entry_price,
     )
     _save(setup)
     logger.info(
-        f"[observation] started watching {symbol} {direction} "
-        f"conf={confidence} — fire in {OBSERVATION_MINUTES} min if holds"
+        f"[observation] watching {symbol} {direction} "
+        f"conf={confidence} entry={entry_price} — "
+        f"fires in {OBSERVATION_MINUTES}min if price holds"
     )
     return True
 
 
 def check_observation(
     symbol: str,
-    direction: str,
-    confidence: float,
+    current_price: float,
 ) -> tuple[str, ObservedSetup | None]:
     """
-    Checks the observation status for a symbol.
+    Checks observation status based on TIME and PRICE — not re-scoring.
 
     Returns:
-        ('fire', setup) — observation complete, signal can fire
-        ('watching', setup) — still in observation period
-        ('cancelled', None) — setup broke down, direction changed
-        ('new', None) — no observation exists yet
+        ('fire', setup) — ready to fire
+        ('watching', setup) — still observing
+        ('cancelled', None) — price moved too far against setup
+        ('none', None) — no observation active
     """
     setup = _load(symbol)
-
     if not setup:
-        return "new", None
+        return "none", None
 
-    # Direction changed — cancel observation
-    if setup.direction != direction:
-        logger.info(
-            f"[observation] {symbol} direction changed "
-            f"{setup.direction} → {direction} — cancelled"
-        )
-        _delete(symbol)
-        return "cancelled", None
+    # Price-based cancellation only
+    if current_price and setup.entry_price > 0:
+        move_pct = (current_price - setup.entry_price) / setup.entry_price * 100
+        if setup.direction == "long" and move_pct < -MAX_ADVERSE_MOVE_PCT:
+            logger.info(
+                f"[observation] {symbol} LONG cancelled — "
+                f"price dropped {abs(move_pct):.2f}% during observation"
+            )
+            _delete(symbol)
+            return "cancelled", None
+        elif setup.direction == "short" and move_pct > MAX_ADVERSE_MOVE_PCT:
+            logger.info(
+                f"[observation] {symbol} SHORT cancelled — "
+                f"price rose {move_pct:.2f}% during observation"
+            )
+            _delete(symbol)
+            return "cancelled", None
 
-    # Check if observation period is complete
+    # Time-based firing
     age = datetime.utcnow() - setup.detected_at
     if age >= timedelta(minutes=OBSERVATION_MINUTES):
-        # Update confidence with latest score
-        setup.confidence = confidence
         setup.checks_passed += 1
-        _save(setup)
         logger.info(
-            f"[observation] {symbol} observation complete — "
-            f"setup held for {OBSERVATION_MINUTES} min — ready to fire"
+            f"[observation] {symbol} {setup.direction} "
+            f"held for {OBSERVATION_MINUTES}min — firing"
         )
         _delete(symbol)
         return "fire", setup
 
-    # Still watching
-    setup.checks_passed += 1
-    setup.confidence = confidence  # Update with latest
-    _save(setup)
     remaining = OBSERVATION_MINUTES - int(age.total_seconds() / 60)
+    setup.checks_passed += 1
+    _save(setup)
     logger.info(
-        f"[observation] {symbol} still watching — "
-        f"{remaining} min remaining | checks={setup.checks_passed}"
+        f"[observation] {symbol} {setup.direction} "
+        f"still watching — {remaining}min remaining"
     )
     return "watching", setup
 
 
 def cancel_observation(symbol: str):
-    """Cancel observation for a symbol — setup broke down."""
     _delete(symbol)
-    logger.info(f"[observation] {symbol} cancelled")
