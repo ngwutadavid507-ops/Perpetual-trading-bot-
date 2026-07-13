@@ -167,11 +167,7 @@ def score_continuation(
         logger.debug("Continuation blocked: 1H sideways")
         return None, 0, []
 
-    if trend_4h == "sideways":
-        logger.debug("Continuation blocked: 4H sideways")
-        return None, 0, []
-
-    if trend_1h != trend_4h:
+    if trend_4h != "sideways" and trend_1h != trend_4h:
         logger.debug(
             f"Continuation blocked: 1H={trend_1h} 4H={trend_4h} disagree"
         )
