@@ -320,7 +320,6 @@ def build_signal(
     observation_confirmed = False
 
     if should_fire_immediately(confidence):
-        # High confidence — fire immediately, no observation needed
         logger.info(
             f"{symbol}: conf={confidence}% >= 85 — "
             f"firing immediately"
@@ -328,33 +327,27 @@ def build_signal(
         observation_confirmed = False
 
     else:
-        # Check observation status
         obs_status, obs_setup = check_observation(
             symbol, direction, confidence
         )
 
         if obs_status == "new":
-            # First time seeing this setup — start observation
             start_observation(
                 symbol, direction, strategy_type,
                 confidence, exchange_id
             )
-            return None  # Don't fire yet — wait for observation
+            return None
 
         elif obs_status == "watching":
-            # Still in observation period — not ready yet
             return None
 
         elif obs_status == "fire":
-            # Observation complete — setup held up
             observation_confirmed = True
             logger.info(
-                f"{symbol}: observation confirmed — "
-                f"setup held for 10 min — firing"
+                f"{symbol}: observation confirmed — firing"
             )
 
         elif obs_status == "cancelled":
-            # Setup broke during observation
             return None
 
     # ── Build signal levels ───────────────────────────────────────────────────
