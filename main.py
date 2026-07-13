@@ -32,7 +32,7 @@ from bot.summary import record_signal_sent, record_result, format_daily_summary
 from bot.redis_client import redis_get, redis_set
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("scanner")
