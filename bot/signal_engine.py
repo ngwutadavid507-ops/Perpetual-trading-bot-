@@ -204,6 +204,11 @@ def _score_setup(
     cont_dir, cont_conf, cont_reasons = score_continuation(
         df_1h, df_5m, support_1h, resistance_1h
     )
+    if cont_dir:
+        logger.info(
+            f"{symbol}: continuation {cont_dir} conf={cont_conf} "
+            f"reasons={len(cont_reasons)}"
+        )
     if (cont_dir and
             cont_conf >= Config.MIN_CONFIDENCE_CONTINUATION and
             cont_conf > best_confidence):
@@ -214,14 +219,21 @@ def _score_setup(
     rev_dir, rev_conf, rev_reasons = score_reversal(
         df_1h, df_5m, support_1h, resistance_1h
     )
+    if rev_dir:
+        logger.info(
+            f"{symbol}: reversal {rev_dir} conf={rev_conf} "
+            f"reasons={len(rev_reasons)}"
+        )
     if (rev_dir and
             rev_conf >= Config.MIN_CONFIDENCE_REVERSAL and
             rev_conf > best_confidence):
         best_confidence = rev_conf
         best = (rev_dir, rev_conf, rev_reasons, "reversal")
 
-    return best
+    if not best:
+        logger.debug(f"{symbol}: no qualifying setup found")
 
+    return best
 
 def build_signal(
     symbol: str,
