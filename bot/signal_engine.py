@@ -134,20 +134,33 @@ def _calculate_sl_and_tps(
     entry: float,
     df_5m: pd.DataFrame,
 ) -> tuple:
+    """
+    ATR-based SL — adapts to each token's volatility.
+    SL = 2x ATR from entry price.
+    Falls back to swing point if ATR unavailable.
+    """
+    atr = df_5m["atr"].iloc[-1] if "atr" in df_5m.columns else None
+    if atr is None or pd.isna(atr) or atr == 0:
+        atr = entry * 0.008  # 0.8% fallback
+
     if direction == "long":
-        swing_sl = df_5m["low"].tail(5).min() * 0.998
-        if swing_sl >= entry:
-            atr = df_5m["atr"].iloc[-1] if "atr" in df_5m.columns else None
-            atr = atr if (atr and not pd.isna(atr)) else entry * 0.005
-            swing_sl = entry - (atr * 1.5)
-        stop_loss = round(swing_sl, 8)
+        # SL at 2x ATR below entry
+        atr_sl = entry - (atr * 2)
+        # Also check swing low — use whichever is further from entry
+        swing_sl = df_5m["low"].tail(10).min() * 0.998
+        stop_loss = round(min(atr_sl, swing_sl), 8)
+        # Safety — SL must be below entry
+        if stop_loss >= entry:
+            stop_loss = round(entry - (atr * 2), 8)
     else:
-        swing_sl = df_5m["high"].tail(5).max() * 1.002
-        if swing_sl <= entry:
-            atr = df_5m["atr"].iloc[-1] if "atr" in df_5m.columns else None
-            atr = atr if (atr and not pd.isna(atr)) else entry * 0.005
-            swing_sl = entry + (atr * 1.5)
-        stop_loss = round(swing_sl, 8)
+        # SL at 2x ATR above entry
+        atr_sl = entry + (atr * 2)
+        # Also check swing high — use whichever is further from entry
+        swing_sl = df_5m["high"].tail(10).max() * 1.002
+        stop_loss = round(max(atr_sl, swing_sl), 8)
+        # Safety — SL must be above entry
+        if stop_loss <= entry:
+            stop_loss = round(entry + (atr * 2), 8)
 
     risk = abs(entry - stop_loss)
     if risk == 0:
