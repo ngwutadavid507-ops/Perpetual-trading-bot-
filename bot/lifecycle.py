@@ -4,7 +4,7 @@ Tracks every signal through its full lifecycle:
 DETECTED → VALIDATED → SENT → ACTIVE → CLOSED
 
 Stores all state in Redis so it survives Railway restarts.
-Records timestamps at each stage for execution quality reporting.
+Deletes entries from Redis when signals close.
 """
 
 import json
@@ -134,13 +134,6 @@ def _from_dict(d: dict) -> SignalLifecycle:
 
 
 def _grade_signal(lc: SignalLifecycle) -> str:
-    """
-    Grades a closed signal based on outcome and timing.
-    A: TP2 or TP3 hit
-    B: TP1 hit
-    C: SL hit after >30 minutes (decent entry, bad timing)
-    D: SL hit within 30 minutes (bad entry or stale price)
-    """
     if lc.state == SignalState.TP3_HIT:
         return "A+"
     if lc.state == SignalState.TP2_HIT:
@@ -150,7 +143,7 @@ def _grade_signal(lc: SignalLifecycle) -> str:
     if lc.state == SignalState.SL_HIT:
         if lc.sl_hit_at and lc.sent_at:
             duration = lc.sl_hit_at - lc.sent_at
-            if duration.total_seconds() < 1800:  # 30 minutes
+            if duration.total_seconds() < 1800:
                 return "D"
         return "C"
     return "C"
@@ -159,8 +152,7 @@ def _grade_signal(lc: SignalLifecycle) -> str:
 class LifecycleTracker:
 
     def save(self, lc: SignalLifecycle):
-        key = lc.symbol
-        redis_hset(LIFECYCLE_KEY, key, json.dumps(_to_dict(lc)))
+        redis_hset(LIFECYCLE_KEY, lc.symbol, json.dumps(_to_dict(lc)))
 
     def load(self, symbol: str) -> SignalLifecycle | None:
         raw = redis_hget(LIFECYCLE_KEY, symbol)
@@ -178,6 +170,7 @@ class LifecycleTracker:
 
     def delete(self, symbol: str):
         redis_hdel(LIFECYCLE_KEY, symbol)
+        logger.info(f"[lifecycle] deleted {symbol} from Redis")
 
     def is_active(self, symbol: str) -> bool:
         lc = self.load(symbol)
@@ -207,8 +200,19 @@ class LifecycleTracker:
                     redis_hdel(LIFECYCLE_KEY, symbol)
                     continue
                 lc = _from_dict(json.loads(raw))
-                if self.is_active(symbol):
+                if lc.state in (
+                    SignalState.SENT,
+                    SignalState.ACTIVE,
+                    SignalState.TP1_HIT,
+                    SignalState.TP2_HIT,
+                ):
                     active.append(lc)
+                else:
+                    # Clean up closed signals that weren't deleted
+                    redis_hdel(LIFECYCLE_KEY, symbol)
+                    logger.info(
+                        f"[lifecycle] cleaned up closed signal: {symbol}"
+                    )
             except Exception as e:
                 logger.error(f"[lifecycle] parse error for {symbol}: {e}")
                 redis_hdel(LIFECYCLE_KEY, symbol)
@@ -226,7 +230,7 @@ class LifecycleTracker:
         )
         self.save(lc)
         logger.info(
-            f"[lifecycle] {symbol} SENT — "
+            f"[lifecycle] {symbol} ACTIVE — "
             f"slippage {lc.entry_slippage_pct}%"
         )
 
@@ -260,8 +264,9 @@ class LifecycleTracker:
         lc.closed_at = datetime.utcnow()
         lc.grade = _grade_signal(lc)
         self.save(lc)
+        # Delete from Redis — trade is fully closed
         self.delete(symbol)
-        logger.info(f"[lifecycle] {symbol} TP3 +{pnl_r}R grade={lc.grade}")
+        logger.info(f"[lifecycle] {symbol} TP3 +{pnl_r}R grade={lc.grade} CLOSED")
 
     def mark_sl(self, symbol: str, pnl_r: float):
         lc = self.load(symbol)
@@ -273,8 +278,9 @@ class LifecycleTracker:
         lc.total_pnl_r = round(lc.total_pnl_r + pnl_r, 2)
         lc.grade = _grade_signal(lc)
         self.save(lc)
+        # Delete from Redis — trade is closed
         self.delete(symbol)
-        logger.info(f"[lifecycle] {symbol} SL {pnl_r}R grade={lc.grade}")
+        logger.info(f"[lifecycle] {symbol} SL {pnl_r}R grade={lc.grade} CLOSED")
 
     def mark_expired(self, symbol: str):
         lc = self.load(symbol)
@@ -284,12 +290,10 @@ class LifecycleTracker:
         lc.closed_at = datetime.utcnow()
         lc.grade = "C"
         self.save(lc)
+        self.delete(symbol)
+        logger.info(f"[lifecycle] {symbol} EXPIRED CLOSED")
 
     async def check_all(self, get_price_fn, bot_token: str, chat_id: str):
-        """
-        Checks all active signals against current prices.
-        Sends TP/SL notifications and updates lifecycle state.
-        """
         from bot.notifier import send_result
         from bot.summary import record_result
 
@@ -301,7 +305,6 @@ class LifecycleTracker:
         logger.info(f"[lifecycle] checking {len(active)} active signals")
 
         for lc in active:
-            # Check expiry
             age = datetime.utcnow() - lc.detected_at
             if age > timedelta(hours=MAX_SIGNAL_AGE_HOURS):
                 await send_result(
@@ -314,6 +317,7 @@ class LifecycleTracker:
 
             price = get_price_fn(lc.symbol, lc.exchange)
             if price is None:
+                logger.debug(f"[lifecycle] no price for {lc.symbol}")
                 continue
 
             risk = abs(lc.entry - lc.stop_loss)
@@ -372,7 +376,7 @@ class LifecycleTracker:
                     record_result(lc.symbol, lc.direction, "tp3", pnl_r)
                     self.mark_tp3(lc.symbol, pnl_r)
 
-            else:  # short
+            else:
                 if price >= lc.stop_loss:
                     pnl_r = round((lc.entry - price) / risk, 2)
                     roi_pct = round(pnl_r * lc.sl_pct * lc.leverage, 2)
