@@ -260,6 +260,7 @@ class LifecycleTracker:
         lc.closed_at = datetime.utcnow()
         lc.grade = _grade_signal(lc)
         self.save(lc)
+        self.delete(symbol)
         logger.info(f"[lifecycle] {symbol} TP3 +{pnl_r}R grade={lc.grade}")
 
     def mark_sl(self, symbol: str, pnl_r: float):
@@ -272,6 +273,7 @@ class LifecycleTracker:
         lc.total_pnl_r = round(lc.total_pnl_r + pnl_r, 2)
         lc.grade = _grade_signal(lc)
         self.save(lc)
+        self.delete(symbol)
         logger.info(f"[lifecycle] {symbol} SL {pnl_r}R grade={lc.grade}")
 
     def mark_expired(self, symbol: str):
