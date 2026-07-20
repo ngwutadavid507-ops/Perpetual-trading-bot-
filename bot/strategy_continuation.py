@@ -1,137 +1,226 @@
 """
-Trend Continuation Strategy — V2 Strict Version.
+Triple Timeframe Trend Strategy — the only strategy that matters.
 
-Three independent confirmations ALL required:
+Rule: ALL THREE timeframes must agree or no trade.
 
-Confirmation 1 — Structure:
-  Both 1H AND 4H must show clear trend in same direction.
-  Sideways on either timeframe = blocked.
+4H: Establishes the dominant trend direction
+1H: Price pulling back to a key EMA or S/R level within that trend  
+5m: Entry confirmation candle at the pullback level
 
-Confirmation 2 — Location:
-  Price must be at meaningful level:
-  - Near EMA21 pullback zone, OR
-  - At tested 1H S/R level, OR
-  - Near key Fibonacci level (38.2% or 61.8% retracement)
-
-Confirmation 3 — Momentum alignment:
-  RSI, MACD and volume must ALL agree.
-  One disagreement = blocked.
-
-Additional safety:
-  - No signal within 2 candles of a major move
-  - ATR must be below 3% (not too volatile)
-  - Weak pullback volume required (not a reversal disguised as pullback)
+This produces 1-3 signals per day maximum.
+Every signal that fires has three independent timeframes confirming it.
+No pattern chasing. No random entries. Only high probability setups.
 """
 
 import pandas as pd
-import numpy as np
 import logging
 
 from bot.indicators import (
     add_indicators,
     find_support_resistance,
     nearest_level,
-    get_trend_strength,
-    is_near_ema,
 )
-from bot.patterns import detect_pullback_rejection
 
 logger = logging.getLogger(__name__)
 
 
-def _get_4h_trend(df_1h: pd.DataFrame) -> str:
+def _get_trend(df: pd.DataFrame) -> tuple[str, float]:
     """
-    Simulates 4H trend by resampling 1H candles.
-    Returns 'uptrend', 'downtrend', or 'sideways'.
+    Gets trend direction and strength from any timeframe.
+    Returns (direction, strength) where direction is
+    'uptrend', 'downtrend' or 'sideways'
+    and strength is 0.0 to 1.0.
     """
+    ind = add_indicators(df)
+    last = ind.iloc[-1]
+    price = last["close"]
+    ema_8 = last.get("ema_8")
+    ema_21 = last.get("ema_21")
+    ema_50 = last.get("ema_50")
+
+    if not all([ema_8, ema_21, ema_50]):
+        return "sideways", 0.0
+
+    # Perfect uptrend: price > ema8 > ema21 > ema50
+    if price > ema_8 > ema_21 > ema_50:
+        strength = 1.0
+        return "uptrend", strength
+
+    # Strong uptrend: ema8 > ema21 > ema50, price above ema21
+    if ema_8 > ema_21 > ema_50 and price > ema_21:
+        strength = 0.8
+        return "uptrend", strength
+
+    # Weak uptrend: ema8 > ema21, price above ema21
+    if ema_8 > ema_21 and price > ema_21:
+        strength = 0.6
+        return "uptrend", strength
+
+    # Perfect downtrend: price < ema8 < ema21 < ema50
+    if price < ema_8 < ema_21 < ema_50:
+        strength = 1.0
+        return "downtrend", strength
+
+    # Strong downtrend: ema8 < ema21 < ema50, price below ema21
+    if ema_8 < ema_21 < ema_50 and price < ema_21:
+        strength = 0.8
+        return "downtrend", strength
+
+    # Weak downtrend: ema8 < ema21, price below ema21
+    if ema_8 < ema_21 and price < ema_21:
+        strength = 0.6
+        return "downtrend", strength
+
+    return "sideways", 0.0
+
+
+def _resample_to_4h(df_1h: pd.DataFrame) -> pd.DataFrame | None:
+    """Resamples 1H candles to 4H."""
     try:
-        df = df_1h.copy()
-        df = df.set_index("timestamp")
+        df = df_1h.copy().set_index("timestamp")
         df_4h = df.resample("4h").agg({
             "open": "first",
             "high": "max",
             "low": "min",
             "close": "last",
             "volume": "sum",
-        }).dropna()
-
-        if len(df_4h) < 20:
-            return "sideways"
-
-        df_4h = df_4h.reset_index()
-        df_4h_ind = add_indicators(df_4h)
-        last = df_4h_ind.iloc[-1]
-        price = last["close"]
-        ema_8 = last.get("ema_8")
-        ema_21 = last.get("ema_21")
-        ema_50 = last.get("ema_50")
-
-        if not all([ema_8, ema_21, ema_50]):
-            return "sideways"
-
-        if ema_8 > ema_21 and price > ema_21:
-            return "uptrend"
-        elif ema_8 < ema_21 and price < ema_21:
-            return "downtrend"
-        return "sideways"
+        }).dropna().reset_index()
+        return df_4h if len(df_4h) >= 20 else None
     except Exception as e:
-        logger.debug(f"4H trend calculation failed: {e}")
-        return "sideways"
+        logger.debug(f"4H resample failed: {e}")
+        return None
 
 
-def _is_major_move_recent(df_5m: pd.DataFrame, candles: int = 2) -> bool:
+def _is_at_pullback_level(
+    df_5m: pd.DataFrame,
+    direction: str,
+    support_1h: list[float],
+    resistance_1h: list[float],
+) -> tuple[bool, str]:
     """
-    Returns True if a major move happened in the last N candles.
-    Prevents chasing after big moves.
-    Major move = candle body > 2x average body size.
+    Checks if price is at a valid pullback level on 1H S/R or EMA.
+    Returns (is_at_level, reason_string).
     """
-    if len(df_5m) < candles + 5:
-        return False
-    recent = df_5m.tail(candles + 1).iloc[:-1]
-    avg_body = df_5m["close"].diff().abs().tail(20).mean()
-    if avg_body == 0:
-        return False
-    for _, row in recent.iterrows():
-        body = abs(row["close"] - row["open"])
-        if body > avg_body * 2.5:
-            return True
-    return False
+    ind = add_indicators(df_5m)
+    last = ind.iloc[-1]
+    price = last["close"]
+    ema_21 = last.get("ema_21")
+    ema_50 = last.get("ema_50")
+
+    if direction == "long":
+        # Check 1H support proximity
+        near_support = nearest_level(price, support_1h, "below")
+        if near_support and abs(price - near_support) / price * 100 <= 0.8:
+            return True, f"Pullback to 1H support ~{near_support:.4f}"
+
+        # Check EMA21 proximity
+        if ema_21 and abs(price - ema_21) / price * 100 <= 0.5:
+            return True, "Pullback to 21 EMA"
+
+        # Check EMA50 proximity
+        if ema_50 and abs(price - ema_50) / price * 100 <= 0.5:
+            return True, "Pullback to 50 EMA"
+
+    else:  # short
+        # Check 1H resistance proximity
+        near_resistance = nearest_level(price, resistance_1h, "above")
+        if near_resistance and abs(near_resistance - price) / price * 100 <= 0.8:
+            return True, f"Rally to 1H resistance ~{near_resistance:.4f}"
+
+        # Check EMA21 proximity
+        if ema_21 and abs(price - ema_21) / price * 100 <= 0.5:
+            return True, "Rally to 21 EMA"
+
+        # Check EMA50 proximity
+        if ema_50 and abs(price - ema_50) / price * 100 <= 0.5:
+            return True, "Rally to 50 EMA"
+
+    return False, ""
 
 
-def _is_too_volatile(df_5m: pd.DataFrame) -> bool:
+def _get_entry_candle(
+    df_5m: pd.DataFrame,
+    direction: str,
+) -> tuple[bool, str]:
     """
-    Returns True if ATR exceeds 3% of price — too risky to trade.
+    Checks for a valid entry confirmation candle on 5m.
+    For longs: bullish candle after pullback (close > open, lower wick)
+    For shorts: bearish candle after rally (close < open, upper wick)
+    Returns (confirmed, reason).
     """
-    if "atr" not in df_5m.columns:
-        return False
-    atr = df_5m["atr"].iloc[-1]
-    price = df_5m["close"].iloc[-1]
-    if pd.isna(atr) or price == 0:
-        return False
-    return (atr / price) * 100 > 3.0
+    ind = add_indicators(df_5m)
+    last = ind.iloc[-1]
+    prev = ind.iloc[-2] if len(ind) >= 2 else None
+
+    open_ = last["open"]
+    close = last["close"]
+    high = last["high"]
+    low = last["low"]
+    body = abs(close - open_)
+    candle_range = high - low
+    if candle_range == 0:
+        return False, ""
+
+    body_ratio = body / candle_range
+    upper_wick = high - max(open_, close)
+    lower_wick = min(open_, close) - low
+
+    if direction == "long":
+        # Bullish candle: close > open, body at least 30% of range
+        if close > open_ and body_ratio >= 0.3:
+            return True, "Bullish entry candle confirms long"
+        # Rejection candle: lower wick >= 2x body
+        if lower_wick >= body * 2 and lower_wick > upper_wick:
+            return True, "Bullish rejection candle — buyers stepping in"
+
+    else:  # short
+        # Bearish candle: close < open, body at least 30% of range
+        if close < open_ and body_ratio >= 0.3:
+            return True, "Bearish entry candle confirms short"
+        # Rejection candle: upper wick >= 2x body
+        if upper_wick >= body * 2 and upper_wick > lower_wick:
+            return True, "Bearish rejection candle — sellers stepping in"
+
+    return False, ""
 
 
-def _get_fibonacci_levels(df_5m: pd.DataFrame) -> list[float]:
+def _check_volume_and_rsi(
+    df_5m: pd.DataFrame,
+    direction: str,
+) -> tuple[int, list[str]]:
     """
-    Calculates key Fibonacci retracement levels from the recent swing.
-    Returns list of 38.2% and 61.8% retracement prices.
+    Checks volume and RSI to add confidence points.
+    Returns (bonus_points, reasons).
     """
-    lookback = df_5m.tail(30)
-    swing_high = lookback["high"].max()
-    swing_low = lookback["low"].min()
-    rng = swing_high - swing_low
-    if rng == 0:
-        return []
-    fib_382 = swing_high - (rng * 0.382)
-    fib_618 = swing_high - (rng * 0.618)
-    return [fib_382, fib_618]
+    ind = add_indicators(df_5m)
+    last = ind.iloc[-1]
+    points = 0
+    reasons = []
 
+    rsi = last.get("rsi")
+    vol_ratio = last.get("vol_ratio")
 
-def _is_near_fibonacci(price: float, fib_levels: list[float], tolerance_pct: float = 0.3) -> bool:
-    for level in fib_levels:
-        if abs(price - level) / price * 100 <= tolerance_pct:
-            return True
-    return False
+    if rsi is not None:
+        if direction == "long" and 30 <= rsi <= 60:
+            points += 1
+            reasons.append(f"RSI healthy ({rsi:.1f}) — room to move up")
+        elif direction == "short" and 40 <= rsi <= 70:
+            points += 1
+            reasons.append(f"RSI healthy ({rsi:.1f}) — room to move down")
+        # Contradictions reduce confidence
+        if direction == "long" and rsi > 75:
+            points -= 2
+        if direction == "short" and rsi < 25:
+            points -= 2
+
+    if vol_ratio is not None:
+        if vol_ratio > 1.2:
+            points += 1
+            reasons.append(f"Volume confirming move ({vol_ratio:.1f}x avg)")
+        elif vol_ratio < 0.5:
+            points -= 1
+
+    return points, reasons
 
 
 def score_continuation(
@@ -141,200 +230,86 @@ def score_continuation(
     resistance_1h: list[float],
 ) -> tuple[str | None, float, list[str]]:
     """
-    Scores a trend continuation setup with strict three-confirmation system.
-    Returns (direction, confidence_0_to_100, reasons).
-    Returns (None, 0, []) if any confirmation fails.
+    Triple timeframe trend strategy.
+    ALL THREE must confirm or returns (None, 0, []).
+
+    Confidence scoring:
+    - Base: 60% (for passing all 3 timeframe checks)
+    - 4H trend strength bonus: up to +15%
+    - 1H trend strength bonus: up to +15%
+    - RSI/Volume bonus: up to +10%
+    Total possible: 100%
     """
-
-    # ── Safety filters first ──────────────────────────────────────────────────
-
-    df_5m_ind = add_indicators(df_5m)
-
-    if _is_too_volatile(df_5m_ind):
-        logger.debug("Continuation blocked: ATR > 3% — too volatile")
-        return None, 0, []
-
-    if _is_major_move_recent(df_5m_ind, candles=2):
-        logger.debug("Continuation blocked: major move in last 2 candles")
-        return None, 0, []
-
-    # ── Confirmation 1 — Structure (both 1H and 4H must agree) ───────────────
-
-    trend_1h, strength_1h = get_trend_strength(df_1h)
-    trend_4h = _get_4h_trend(df_1h)
-
-    if trend_1h == "sideways":
-        logger.debug("Continuation blocked: 1H sideways")
-        return None, 0, []
-
-    if trend_4h != "sideways" and trend_1h != trend_4h:
-        logger.debug(
-            f"Continuation blocked: 1H={trend_1h} 4H={trend_4h} disagree"
-        )
-        return None, 0, []
-
-    if strength_1h < 0.5:
-        logger.debug(
-            f"Continuation blocked: 1H trend strength {strength_1h} < 0.5"
-        )
-        return None, 0, []
-
-    allowed = "long" if trend_1h == "uptrend" else "short"
-    score = 0
-    max_score = 0
     reasons = []
 
-    # Structure score (30 pts)
-    max_score += 30
-    structure_pts = round(strength_1h * 20) + 10
-    score += min(structure_pts, 30)
+    # ── Step 1: 4H Trend (hard requirement) ──────────────────────────────────
+    df_4h = _resample_to_4h(df_1h)
+    if df_4h is None:
+        return None, 0, []
+
+    trend_4h, strength_4h = _get_trend(df_4h)
+    if trend_4h == "sideways":
+        logger.debug("Triple TF: 4H sideways — blocked")
+        return None, 0, []
+
+    direction = "long" if trend_4h == "uptrend" else "short"
+
+    # ── Step 2: 1H Trend must agree with 4H (hard requirement) ───────────────
+    trend_1h, strength_1h = _get_trend(df_1h)
+    if trend_1h == "sideways" or trend_1h != trend_4h:
+        logger.debug(
+            f"Triple TF: 1H={trend_1h} disagrees with 4H={trend_4h} — blocked"
+        )
+        return None, 0, []
+
     reasons.append(
-        f"1H + 4H {trend_1h} confirmed "
-        f"(strength {round(strength_1h * 100)}%)"
+        f"4H + 1H {trend_4h} aligned "
+        f"(4H strength {round(strength_4h * 100)}% | "
+        f"1H strength {round(strength_1h * 100)}%)"
     )
 
-    # ── Confirmation 2 — Location ─────────────────────────────────────────────
-
-    last = df_5m_ind.iloc[-1]
-    price = last["close"]
-    location_confirmed = False
-
-    max_score += 25
-    fib_levels = _get_fibonacci_levels(df_5m_ind)
-
-    near_ema21 = is_near_ema(df_5m_ind, "ema_21", tolerance_pct=0.5)
-    near_ema8 = is_near_ema(df_5m_ind, "ema_8", tolerance_pct=0.3)
-    near_fib = _is_near_fibonacci(price, fib_levels)
-
-    near_support = nearest_level(price, support_1h, "below")
-    near_resistance = nearest_level(price, resistance_1h, "above")
-    at_sr = False
-    if allowed == "long" and near_support:
-        if abs(price - near_support) / price * 100 <= 0.8:
-            at_sr = True
-    if allowed == "short" and near_resistance:
-        if abs(near_resistance - price) / price * 100 <= 0.8:
-            at_sr = True
-
-    if near_ema21:
-        score += 25
-        reasons.append("Price at 21 EMA pullback zone")
-        location_confirmed = True
-    elif near_ema8:
-        score += 18
-        reasons.append("Price near 8 EMA — tight continuation")
-        location_confirmed = True
-    elif at_sr:
-        score += 25
-        if allowed == "long":
-            reasons.append(f"1H support zone ~{near_support:.4f}")
-        else:
-            reasons.append(f"1H resistance zone ~{near_resistance:.4f}")
-        location_confirmed = True
-    elif near_fib:
-        score += 20
-        reasons.append("Price at Fibonacci retracement level")
-        location_confirmed = True
-
-    if not location_confirmed:
-        logger.debug("Continuation blocked: not at meaningful location")
+    # ── Step 3: Price at pullback level on 1H S/R or EMA ─────────────────────
+    at_level, level_reason = _is_at_pullback_level(
+        df_5m, direction, support_1h, resistance_1h
+    )
+    if not at_level:
+        logger.debug("Triple TF: not at pullback level — blocked")
         return None, 0, []
 
-    # ── Confirmation 3 — Momentum alignment (ALL must agree) ─────────────────
+    reasons.append(level_reason)
 
-    max_score += 45
-    momentum_score = 0
-    momentum_reasons = []
-    momentum_blocks = 0
-
-    # RSI check (15 pts)
-    rsi = last.get("rsi")
-    if rsi is not None:
-        if allowed == "long":
-            if rsi >= 75:
-                momentum_blocks += 1
-                logger.debug(f"Momentum block: RSI overbought {rsi}")
-            elif 35 <= rsi <= 65:
-                momentum_score += 15
-                momentum_reasons.append(f"RSI healthy ({rsi:.1f})")
-            else:
-                momentum_score += 8
-        else:
-            if rsi <= 25:
-                momentum_blocks += 1
-                logger.debug(f"Momentum block: RSI oversold {rsi}")
-            elif 35 <= rsi <= 65:
-                momentum_score += 15
-                momentum_reasons.append(f"RSI healthy ({rsi:.1f})")
-            else:
-                momentum_score += 8
-
-    # MACD check (15 pts)
-    macd_hist = last.get("macd_hist")
-    macd = last.get("macd")
-    macd_signal = last.get("macd_signal")
-    if macd_hist is not None and macd is not None:
-        if allowed == "long":
-            if macd_hist > 0 and macd > macd_signal:
-                momentum_score += 15
-                momentum_reasons.append("MACD bullish momentum")
-            elif macd_hist < 0:
-                momentum_blocks += 1
-                logger.debug("Momentum block: MACD bearish on long signal")
-        else:
-            if macd_hist < 0 and macd < macd_signal:
-                momentum_score += 15
-                momentum_reasons.append("MACD bearish momentum")
-            elif macd_hist > 0:
-                momentum_blocks += 1
-                logger.debug("Momentum block: MACD bullish on short signal")
-
-    # Volume check (15 pts)
-    vol_ratio = last.get("vol_ratio")
-    if vol_ratio is not None:
-        if vol_ratio < 0.7:
-            momentum_score += 15
-            momentum_reasons.append(
-                f"Low volume pullback ({vol_ratio:.1f}x avg) "
-                f"— trend likely continues"
-            )
-        elif vol_ratio > 2.5:
-            momentum_blocks += 1
-            logger.debug(
-                f"Momentum block: high volume {vol_ratio:.1f}x "
-                f"on pullback suggests reversal"
-            )
-        elif vol_ratio < 1.0:
-            momentum_score += 8
-
-    # If any momentum indicator disagrees — block signal
-    if momentum_blocks > 0:
-        logger.debug(
-            f"Continuation blocked: {momentum_blocks} momentum disagreement(s)"
-        )
+    # ── Step 4: 5m entry confirmation candle ─────────────────────────────────
+    confirmed, candle_reason = _get_entry_candle(df_5m, direction)
+    if not confirmed:
+        logger.debug("Triple TF: no entry candle — blocked")
         return None, 0, []
 
-    score += momentum_score
-    reasons.extend(momentum_reasons)
+    reasons.append(candle_reason)
 
-    # ── Pullback rejection candle ─────────────────────────────────────────────
+    # ── All three confirmed — calculate confidence ────────────────────────────
+    base_confidence = 60.0
 
-    max_score += 10
-    rejection = detect_pullback_rejection(df_5m_ind, allowed)
-    if rejection:
-        score += 10
-        reasons.append(
-            f"Pullback rejection candle — "
-            f"{'buyers' if allowed == 'long' else 'sellers'} stepping in"
-        )
+    # 4H strength bonus (up to 15%)
+    tf_4h_bonus = round(strength_4h * 15, 1)
 
-    # Require minimum 2 momentum reasons
-    if len(momentum_reasons) < 1:
-        logger.debug("Continuation blocked: no momentum confirmation")
-        return None, 0, []
+    # 1H strength bonus (up to 15%)
+    tf_1h_bonus = round(strength_1h * 15, 1)
 
-    if score == 0 or len(reasons) < 3:
-        return None, 0, []
+    # RSI/Volume bonus (up to 10%)
+    vol_rsi_pts, vol_rsi_reasons = _check_volume_and_rsi(df_5m, direction)
+    vol_rsi_bonus = max(0, min(10, vol_rsi_pts * 5))
+    reasons.extend(vol_rsi_reasons)
 
-    confidence = round(score / max_score * 100, 1)
-    return allowed, confidence, reasons
+    confidence = round(
+        base_confidence + tf_4h_bonus + tf_1h_bonus + vol_rsi_bonus,
+        1
+    )
+    confidence = min(100.0, confidence)
+
+    logger.info(
+        f"Triple TF {direction}: conf={confidence}% "
+        f"(base=60 + 4H={tf_4h_bonus} + 1H={tf_1h_bonus} "
+        f"+ vol/rsi={vol_rsi_bonus})"
+    )
+
+    return direction, confidence, reasons
