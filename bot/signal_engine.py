@@ -1,19 +1,17 @@
 """
-V2 Signal Engine with price-based observation system.
+V2 Signal Engine — Triple Timeframe Only.
 
-Flow:
-1. Run both strategies to detect setup
-2. If confidence >= 85% → fire immediately
-3. If confidence 65-84% → start 10-minute observation
-4. During observation, only cancel if price moves >1% against setup
-5. After 10 minutes, fire if price held
-6. SL always calculated from live entry price using ATR
+Only one strategy now: Triple Timeframe Trend.
+4H + 1H + 5m must all agree.
+Produces 1-5 signals per day of genuinely high quality.
 
-No artificial time gaps — signals fire when market gives a setup.
-Spacing is handled by:
-- 60-minute per-symbol cooldown
-- Daily limit of 15 signals
-- Observation period filters fake breakouts
+Observation system:
+- Confidence >= 85%: fire immediately
+- Confidence 60-84%: observe for 10 minutes (price-based)
+- Cancel only if price moves >1% against setup during observation
+
+SL: 2x ATR from entry (adapts to volatility)
+TP: 3x, 5x, 7x risk
 """
 
 import logging
@@ -24,7 +22,6 @@ import pandas as pd
 
 from bot.indicators import add_indicators, find_support_resistance
 from bot.strategy_continuation import score_continuation
-from bot.strategy_reversal import score_reversal
 from bot.news_filter import should_block_signal, get_confidence_boost
 from bot.observation import (
     should_fire_immediately,
@@ -82,35 +79,28 @@ def _calculate_volatility(df: pd.DataFrame) -> str:
 def _calculate_leverage(
     confidence: float,
     volatility: str,
-    strategy_type: str,
     observation_confirmed: bool,
 ) -> int:
-    obs_bonus = 1 if observation_confirmed else 0
+    """
+    Leverage based on confidence and volatility.
+    Observation-confirmed signals get slightly higher leverage.
+    """
+    obs_bonus = 5 if observation_confirmed else 0
 
-    if strategy_type == "reversal":
-        if confidence >= 95:
-            return (25 + obs_bonus * 5) if volatility == "low" else 20
-        elif confidence >= 90:
-            return (20 + obs_bonus * 5) if volatility == "low" else 15
-        elif confidence >= 85:
-            return (15 + obs_bonus * 5) if volatility == "low" else 10
-        elif confidence >= 80:
-            return 15 if volatility == "low" else 10
-        else:
-            return 10 if volatility == "low" else 7
+    if confidence >= 95:
+        base = 50 if volatility == "low" else 35
+    elif confidence >= 90:
+        base = 35 if volatility == "low" else 25
+    elif confidence >= 85:
+        base = 25 if volatility == "low" else 20
+    elif confidence >= 80:
+        base = 20 if volatility == "low" else 15
+    elif confidence >= 75:
+        base = 15 if volatility == "low" else 10
     else:
-        if confidence >= 95:
-            return 50 if volatility == "low" else 35
-        elif confidence >= 90:
-            return (35 + obs_bonus * 5) if volatility == "low" else 25
-        elif confidence >= 85:
-            return (25 + obs_bonus * 5) if volatility == "low" else 20
-        elif confidence >= 80:
-            return (20 + obs_bonus * 5) if volatility == "low" else 15
-        elif confidence >= 75:
-            return 20 if volatility == "low" else 15
-        else:
-            return 15 if volatility == "low" else 10
+        base = 10 if volatility == "low" else 7
+
+    return min(50, base + obs_bonus)
 
 
 def _calculate_sl_and_tps(
@@ -119,9 +109,9 @@ def _calculate_sl_and_tps(
     df_5m: pd.DataFrame,
 ) -> tuple:
     """
-    ATR-based SL — adapts to each token's volatility.
-    SL = 2x ATR from entry, or beyond swing point whichever is wider.
-    All percentages calculated from live entry price.
+    ATR-based SL — 2x ATR from entry or beyond swing point,
+    whichever gives more room. Protects against normal volatility.
+    All percentages from live entry price.
     """
     atr = df_5m["atr"].iloc[-1] if "atr" in df_5m.columns else None
     if atr is None or pd.isna(atr) or atr == 0:
@@ -161,47 +151,6 @@ def _calculate_sl_and_tps(
     return stop_loss, tp1, tp2, tp3, sl_pct, tp1_pct, tp2_pct, tp3_pct
 
 
-def _score_setup(
-    symbol: str,
-    df_1h: pd.DataFrame,
-    df_5m: pd.DataFrame,
-    support_1h: list,
-    resistance_1h: list,
-) -> tuple | None:
-    best = None
-    best_confidence = 0
-
-    cont_dir, cont_conf, cont_reasons = score_continuation(
-        df_1h, df_5m, support_1h, resistance_1h
-    )
-    if cont_dir:
-        logger.info(
-            f"{symbol}: continuation {cont_dir} "
-            f"conf={cont_conf} reasons={len(cont_reasons)}"
-        )
-    if (cont_dir and
-            cont_conf >= Config.MIN_CONFIDENCE_CONTINUATION and
-            cont_conf > best_confidence):
-        best_confidence = cont_conf
-        best = (cont_dir, cont_conf, cont_reasons, "continuation")
-
-    rev_dir, rev_conf, rev_reasons = score_reversal(
-        df_1h, df_5m, support_1h, resistance_1h
-    )
-    if rev_dir:
-        logger.info(
-            f"{symbol}: reversal {rev_dir} "
-            f"conf={rev_conf} reasons={len(rev_reasons)}"
-        )
-    if (rev_dir and
-            rev_conf >= Config.MIN_CONFIDENCE_REVERSAL and
-            rev_conf > best_confidence):
-        best_confidence = rev_conf
-        best = (rev_dir, rev_conf, rev_reasons, "reversal")
-
-    return best
-
-
 def build_signal(
     symbol: str,
     exchange_id: str,
@@ -212,9 +161,10 @@ def build_signal(
 
     if df_1h is None or df_5m is None:
         return None
-    if len(df_1h) < 50 or len(df_5m) < 50:
+    if len(df_1h) < 60 or len(df_5m) < 50:
         return None
 
+    # Get 1H S/R levels
     df_1h_ind = add_indicators(df_1h)
     support_1h, resistance_1h = find_support_resistance(
         df_1h_ind, lookback=80, min_touches=2
@@ -223,27 +173,28 @@ def build_signal(
     df_5m_ind = add_indicators(df_5m)
     entry = live_price if live_price else df_5m_ind["close"].iloc[-1]
 
-    # Validate slippage
+    # Slippage check
     if live_price:
         candle_price = df_5m_ind["close"].iloc[-1]
         slippage = abs(live_price - candle_price) / candle_price * 100
         if slippage > Config.MAX_ENTRY_SLIPPAGE_PCT:
-            logger.info(
-                f"{symbol}: discarded — slippage {slippage:.2f}%"
+            logger.debug(
+                f"{symbol}: slippage {slippage:.2f}% — discarded"
             )
             return None
 
-    # Score setup
-    setup = _score_setup(
-        symbol, df_1h, df_5m, support_1h, resistance_1h
+    # Triple timeframe scoring — only strategy
+    direction, confidence, reasons = score_continuation(
+        df_1h, df_5m, support_1h, resistance_1h
     )
 
-    if not setup:
+    if not direction or confidence == 0:
         return None
 
-    direction, confidence, reasons, strategy_type = setup
+    if confidence < Config.MIN_CONFIDENCE_CONTINUATION:
+        return None
 
-    # Duplicate check — 60 min cooldown per symbol
+    # Duplicate check
     if _is_duplicate(symbol, direction):
         return None
 
@@ -253,7 +204,7 @@ def build_signal(
         base, direction, Config.NEWS_LOOKBACK_HOURS
     )
     if blocked:
-        logger.info(f"{symbol}: blocked by news — {block_reason}")
+        logger.info(f"{symbol}: news block — {block_reason}")
         return None
 
     news_boost = get_confidence_boost(
@@ -261,25 +212,22 @@ def build_signal(
     )
     if news_boost > 0:
         confidence = min(100.0, confidence + news_boost)
-        reasons.append(
-            f"News confirms {direction} (+{news_boost}% confidence)"
-        )
+        reasons.append(f"News confirms {direction} (+{news_boost}%)")
 
-    # ── Observation system (price-based) ─────────────────────────────────────
+    # ── Observation system ────────────────────────────────────────────────────
 
     observation_confirmed = False
 
     if should_fire_immediately(confidence):
         logger.info(
-            f"{symbol}: conf={confidence}% >= 85 — firing immediately"
+            f"{symbol}: conf={confidence}% — firing immediately"
         )
-
     else:
         obs_status, obs_setup = check_observation(symbol, entry)
 
         if obs_status == "none":
             start_observation(
-                symbol, direction, strategy_type,
+                symbol, direction, "continuation",
                 confidence, exchange_id, entry
             )
             return None
@@ -289,12 +237,14 @@ def build_signal(
 
         elif obs_status == "fire":
             observation_confirmed = True
-            logger.info(f"{symbol}: observation complete — firing")
+            logger.info(
+                f"{symbol}: 10min observation passed — firing"
+            )
 
         elif obs_status == "cancelled":
             return None
 
-    # ── Build signal levels ───────────────────────────────────────────────────
+    # ── Build levels from live price ──────────────────────────────────────────
 
     result = _calculate_sl_and_tps(direction, entry, df_5m_ind)
     if result[0] is None:
@@ -305,7 +255,7 @@ def build_signal(
 
     volatility = _calculate_volatility(df_5m_ind)
     leverage = _calculate_leverage(
-        confidence, volatility, strategy_type, observation_confirmed
+        confidence, volatility, observation_confirmed
     )
 
     from bot.news_filter import get_news_sentiment
@@ -315,7 +265,7 @@ def build_signal(
         symbol=symbol,
         exchange=exchange_id,
         direction=direction,
-        strategy_type=strategy_type,
+        strategy_type="continuation",
         confidence=confidence,
         entry=round(entry, 8),
         stop_loss=stop_loss,
