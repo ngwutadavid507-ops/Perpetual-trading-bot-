@@ -189,76 +189,64 @@ def score_continuation(
 ) -> tuple[str | None, float, list[str]]:
     """
     Triple timeframe trend strategy.
-    Returns (direction, confidence, reasons) or (None, 0, []).
+    Requirements:
+    1. 4H trend clear
+    2. 1H trend agrees (or 4H weak)
+    3. Price at pullback level (S/R or EMA)
+    Entry candle removed — trend + location is sufficient.
     """
     reasons = []
 
-    # ── Step 1: 4H Trend ─────────────────────────────────────────────────────
+    # Step 1 — 4H trend
     df_4h = _resample_to_4h(df_1h)
     if df_4h is None:
         return None, 0, []
 
     trend_4h, strength_4h = _get_trend(df_4h)
     if trend_4h == "sideways":
-        logger.debug("Triple TF: 4H sideways — blocked")
         return None, 0, []
 
     direction = "long" if trend_4h == "uptrend" else "short"
 
-    # ── Step 2: 1H Trend ─────────────────────────────────────────────────────
+    # Step 2 — 1H trend
     trend_1h, strength_1h = _get_trend(df_1h)
-
     if trend_1h == "sideways":
-        logger.debug("Triple TF: 1H sideways — blocked")
         return None, 0, []
 
-    # 1H and 4H disagree — only block if 4H trend is strong
     if trend_1h != trend_4h and strength_4h >= 0.8:
-        logger.debug(
-            f"Triple TF: 1H={trend_1h} vs strong 4H={trend_4h} — blocked"
-        )
         return None, 0, []
 
-    # If they disagree but 4H is weak — use 1H direction
     if trend_1h != trend_4h:
         direction = "long" if trend_1h == "uptrend" else "short"
         reasons.append(
-            f"1H {trend_1h} leads (4H transitioning) "
-            f"strength={round(strength_1h * 100)}%"
+            f"1H {trend_1h} leads "
+            f"(strength {round(strength_1h * 100)}%)"
         )
     else:
         reasons.append(
-            f"4H + 1H {trend_4h} aligned "
+            f"4H + 1H {trend_4h} confirmed "
             f"(4H={round(strength_4h * 100)}% | "
             f"1H={round(strength_1h * 100)}%)"
         )
 
-    # ── Step 3: Pullback level ────────────────────────────────────────────────
+    # Step 3 — pullback level
     at_level, level_reason = _is_at_pullback_level(
         df_5m, direction, support_1h, resistance_1h
     )
     if not at_level:
-        logger.debug("Triple TF: not at pullback level — blocked")
         return None, 0, []
 
     reasons.append(level_reason)
 
-    # ── Step 4: Entry candle ─────────────────────────────────────────────────
-    confirmed, candle_reason = _get_entry_candle(df_5m, direction)
-    if not confirmed:
-        logger.debug("Triple TF: no entry candle — blocked")
-        return None, 0, []
-
-    reasons.append(candle_reason)
-
-    # ── Confidence calculation ────────────────────────────────────────────────
-    base_confidence = 60.0
-    tf_4h_bonus = round(strength_4h * 15, 1)
-    tf_1h_bonus = round(strength_1h * 15, 1)
-
+    # Bonus points
     vol_rsi_pts, vol_rsi_reasons = _check_volume_and_rsi(df_5m, direction)
     vol_rsi_bonus = max(0, min(10, vol_rsi_pts * 5))
     reasons.extend(vol_rsi_reasons)
+
+    # Confidence
+    base_confidence = 65.0
+    tf_4h_bonus = round(strength_4h * 15, 1)
+    tf_1h_bonus = round(strength_1h * 15, 1)
 
     confidence = min(100.0, round(
         base_confidence + tf_4h_bonus + tf_1h_bonus + vol_rsi_bonus, 1
@@ -266,7 +254,7 @@ def score_continuation(
 
     logger.info(
         f"Triple TF {direction}: conf={confidence}% "
-        f"(base=60 + 4H={tf_4h_bonus} + 1H={tf_1h_bonus} "
+        f"(base=65 + 4H={tf_4h_bonus} + 1H={tf_1h_bonus} "
         f"+ bonus={vol_rsi_bonus})"
     )
 
